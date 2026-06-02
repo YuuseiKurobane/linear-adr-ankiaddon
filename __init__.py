@@ -1288,6 +1288,17 @@ class BatchOptimizeDialog(QDialog):
         file_label.setWordWrap(True)
         layout.addWidget(file_label)
 
+        defaults_form = QFormLayout()
+        self.default_selection_combo = QComboBox(self)
+        for key, label in SCHEDULING_SELECTIONS:
+            self.default_selection_combo.addItem(label, key)
+        defaults_form.addRow("Default scheduling policy", self.default_selection_combo)
+
+        self.default_quality_combo = QComboBox(self)
+        _populate_quality_combo(self.default_quality_combo, select_builtin=DEFAULT_QUALITY)
+        defaults_form.addRow("Default search quality", self.default_quality_combo)
+        layout.addLayout(defaults_form)
+
         self.table = QTableWidget(len(rows), 5, self)
         self.table.setHorizontalHeaderLabels(
             ["Use", "Deck preset", "DR %", "Scheduling policy", "Search quality"]
@@ -1331,12 +1342,15 @@ class BatchOptimizeDialog(QDialog):
             self.table.setCellWidget(row_index, 2, target)
 
             selection_combo = QComboBox(self.table)
+            selection_combo.addItem("Use default", "__default__")
             for key, label in SCHEDULING_SELECTIONS:
                 selection_combo.addItem(label, key)
             self.table.setCellWidget(row_index, 3, selection_combo)
 
             quality_combo = QComboBox(self.table)
             _populate_quality_combo(quality_combo, select_builtin=DEFAULT_QUALITY)
+            quality_combo.insertItem(0, "Use default", {"kind": "default"})
+            quality_combo.setCurrentIndex(0)
             self.table.setCellWidget(row_index, 4, quality_combo)
 
         self.table.resizeColumnsToContents()
@@ -1371,6 +1385,18 @@ class BatchOptimizeDialog(QDialog):
     def _checkbox(self, row_index: int) -> QCheckBox | None:
         box = self.table.cellWidget(row_index, 0)
         return getattr(box, "_linear_adr_checkbox", None)
+
+    def _selection_for_combo(self, combo: QComboBox) -> str:
+        selection = str(combo.currentData() or "__default__")
+        if selection == "__default__":
+            return str(self.default_selection_combo.currentData() or "recommended")
+        return selection
+
+    def _quality_for_combo(self, combo: QComboBox) -> tuple[str, dict[str, Any], str]:
+        data = combo.currentData()
+        if isinstance(data, dict) and data.get("kind") == "default":
+            return _quality_config_for_combo(self.default_quality_combo)
+        return _quality_config_for_combo(combo)
 
     def _accept_request(self) -> None:
         try:
@@ -1415,8 +1441,8 @@ class BatchOptimizeDialog(QDialog):
             if not isinstance(quality_combo, QComboBox):
                 raise ValueError("Quality preset widget missing.")
 
-            selection = str(selection_combo.currentData() or "recommended")
-            quality_base, quality_overrides, quality_label = _quality_config_for_combo(
+            selection = self._selection_for_combo(selection_combo)
+            quality_base, quality_overrides, quality_label = self._quality_for_combo(
                 quality_combo
             )
             job_id = _safe_job_id(preset_name, row_index, selection)
