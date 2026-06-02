@@ -30,6 +30,9 @@ from aqt.qt import (
     QCheckBox,
     QComboBox,
     QDesktopServices,
+    QDate,
+    QDateEdit,
+    QDateTime,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
@@ -45,6 +48,7 @@ from aqt.qt import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -60,6 +64,7 @@ from aqt.utils import showWarning
 from aqt.webview import AnkiWebView
 
 from .adr_button_usage import prompt_and_export
+from .workload_graph import workload_graph_html
 
 
 ADDON_TITLE = "Linear ADR"
@@ -71,6 +76,7 @@ CARS_PATH = ADDON_ROOT / "cars.json"
 ENV_BINARY = "ADR_OPTIMIZER_BINARY"
 
 CAR_SCHEMA_VERSION = 1
+CAR_POSITION_KIND_TIMELINE_START = "timeline_start"
 POLICY_MODE_ADR = "adr"
 POLICY_MODE_FIXED_DR = "fixed_dr"
 POLICY_MODE_NORMAL_ANKI = "normal_anki"
@@ -105,12 +111,11 @@ DEFAULT_ADDON_CONFIG: dict[str, Any] = {
     "warn_before_allowing_car_overtaking": True,
     "warn_before_editing_saved_adr_parameters": True,
     "enable_soft_interval_cap": True,
-    "soft_interval_cap_threshold": 1000.0,
+    "soft_interval_cap_threshold": 3650.0,
     "soft_interval_cap_power": 0.5,
-    "filtered_deck_limit": 100,
     "filtered_deck_reschedule": True,
     "filtered_deck_order": "Due",
-    "filtered_deck_drive_backward": True,
+    "workload_visualizer_subdivisions": 20,
 }
 
 QUALITY_LABELS = {
@@ -1596,6 +1601,26 @@ class ManageCarsDialog(QDialog):
         self.resize(920, 600)
 
         layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Use the planner to drive the oldest car by previewed workload. Manual controls are available below for advanced edits.",
+            self,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        guided_buttons = QHBoxLayout()
+        self.plan_oldest = QPushButton("Plan oldest car movement", self)
+        self.manual_toggle = QPushButton("Manually manage cars", self)
+        guided_buttons.addWidget(self.plan_oldest)
+        guided_buttons.addWidget(self.manual_toggle)
+        guided_buttons.addStretch(1)
+        layout.addLayout(guided_buttons)
+
+        self.manual_container = QWidget(self)
+        manual_layout = QVBoxLayout(self.manual_container)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
+
         self.table = QTableWidget(0, 5, self)
         self.table.setHorizontalHeaderLabels(
             ["Car", "Created", "Position date", "Policies", "Source"]
@@ -1607,20 +1632,22 @@ class ManageCarsDialog(QDialog):
         except AttributeError:
             self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        layout.addWidget(self.table, 1)
+        manual_layout.addWidget(self.table, 1)
 
         car_buttons = QHBoxLayout()
         self.move_position = QPushButton("Move position date", self)
-        self.drive_beginning = QPushButton("Drive to beginning", self)
+        self.drive_beginning = QPushButton("Drive to timeline start", self)
         self.delete_car = QPushButton("Delete", self)
+        self.undo_car = QPushButton("Undo last car change", self)
         car_buttons.addWidget(self.move_position)
         car_buttons.addWidget(self.drive_beginning)
         car_buttons.addWidget(self.delete_car)
+        car_buttons.addWidget(self.undo_car)
         car_buttons.addStretch(1)
-        layout.addLayout(car_buttons)
+        manual_layout.addLayout(car_buttons)
 
         self.track_history = QCheckBox("Track entire ADR optimization history", self)
-        self.warn_new = QCheckBox("Warn before creating a new car while another car is active", self)
+        self.warn_new = QCheckBox("Warn before optimizing while another car is still driving", self)
         self.warn_forward = QCheckBox("Warn before moving a car forward", self)
         self.warn_overtake = QCheckBox("Warn before allowing car overtaking", self)
         self.warn_edit = QCheckBox("Warn before editing saved ADR parameters", self)
@@ -1646,7 +1673,9 @@ class ManageCarsDialog(QDialog):
         settings_grid.addWidget(self.soft_threshold, 6, 1)
         settings_grid.addWidget(QLabel("Soft cap power", self), 7, 0)
         settings_grid.addWidget(self.soft_power, 7, 1)
-        layout.addLayout(settings_grid)
+        manual_layout.addLayout(settings_grid)
+        self.manual_container.setVisible(False)
+        layout.addWidget(self.manual_container, 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -1656,14 +1685,42 @@ class ManageCarsDialog(QDialog):
         buttons.addWidget(close)
         layout.addLayout(buttons)
 
+        qconnect(self.plan_oldest.clicked, self._plan_oldest)
+        qconnect(self.manual_toggle.clicked, self._toggle_manual)
         qconnect(self.move_position.clicked, self._move_selected)
         qconnect(self.drive_beginning.clicked, self._drive_selected_to_beginning)
         qconnect(self.delete_car.clicked, self._delete_selected)
+        qconnect(self.undo_car.clicked, self._undo_last_car_change)
         qconnect(save.clicked, self._save_settings)
         qconnect(close.clicked, self.accept)
 
         self._load_settings()
         self._refresh_table()
+
+    def _toggle_manual(self) -> None:
+        visible = not self.manual_container.isVisible()
+        self.manual_container.setVisible(visible)
+        self.manual_toggle.setText("Hide manual controls" if visible else "Manually manage cars")
+
+    def _plan_oldest(self) -> None:
+        dialog = SchedulingOperationDialog("manage", None)
+        if _exec_dialog(dialog) != 1 or dialog.options is None:
+            return
+        applied = _apply_car_moves(dialog.options.get("car_moves", []))
+        if applied:
+            _show_info("Applied car movement.")
+        else:
+            _show_info("No car movement selected.")
+        self._refresh_table()
+
+    def _undo_last_car_change(self) -> None:
+        if not _confirm("Undo the most recent ADR car-state change?"):
+            return
+        if _undo_last_car_state_transaction():
+            _show_info("Restored the previous car state.")
+            self._refresh_table()
+        else:
+            showWarning("No undoable car-state change was found.", title=ADDON_TITLE)
 
     def _load_settings(self) -> None:
         config = _addon_config()
@@ -1673,7 +1730,7 @@ class ManageCarsDialog(QDialog):
         self.warn_overtake.setChecked(bool(config.get("warn_before_allowing_car_overtaking", True)))
         self.warn_edit.setChecked(bool(config.get("warn_before_editing_saved_adr_parameters", True)))
         self.soft_cap.setChecked(bool(config.get("enable_soft_interval_cap", True)))
-        self.soft_threshold.setValue(float(config.get("soft_interval_cap_threshold", 1000.0)))
+        self.soft_threshold.setValue(float(config.get("soft_interval_cap_threshold", 3650.0)))
         self.soft_power.setValue(float(config.get("soft_interval_cap_power", 0.5)))
 
     def _save_settings(self) -> None:
@@ -1696,7 +1753,7 @@ class ManageCarsDialog(QDialog):
             items = [
                 _short_car_id(car),
                 str(car.get("created_at", "")),
-                str(car.get("position_date", "")),
+                _car_position_label(car),
                 _policy_summary(car),
                 str(car.get("created_by", "")),
             ]
@@ -1733,16 +1790,16 @@ class ManageCarsDialog(QDialog):
         if car is None:
             showWarning("Select a car first.", title=ADDON_TITLE)
             return
-        current = str(car.get("position_date", dt.date.today().isoformat()))
-        text, ok = QInputDialog.getText(
-            self,
-            ADDON_TITLE,
-            "Position date (YYYY-MM-DD)",
-            text=current,
-        )
-        if not ok:
+        if _is_timeline_start_car(car):
+            showWarning(
+                "This car is already at timeline start. Move a newer car, or delete this one from manual management.",
+                title=ADDON_TITLE,
+            )
             return
-        new_date = str(text).strip()
+        current = str(car.get("position_date", dt.date.today().isoformat()))
+        new_date = _prompt_date(self, "Move position date", current)
+        if new_date is None:
+            return
         try:
             parsed_new = dt.date.fromisoformat(new_date)
             parsed_old = dt.date.fromisoformat(current[:10])
@@ -1760,7 +1817,16 @@ class ManageCarsDialog(QDialog):
             ):
                 return
 
-        _update_active_car(str(car.get("id")), {"position_date": parsed_new.isoformat()})
+        _apply_car_moves(
+            [
+                {
+                    "car_id": str(car.get("id")),
+                    "short_id": _short_car_id(car),
+                    "old_position_date": current,
+                    "new_position_date": parsed_new.isoformat(),
+                }
+            ]
+        )
         self._refresh_table()
 
     def _drive_selected_to_beginning(self) -> None:
@@ -1768,9 +1834,15 @@ class ManageCarsDialog(QDialog):
         if car is None:
             showWarning("Select a car first.", title=ADDON_TITLE)
             return
-        if not _confirm("Drive this car to the beginning and remove it from active scheduling?"):
+        if not _confirm(
+            "Drive this car to timeline start?\n\n"
+            "It will remain active as the oldest scheduler, and any previous timeline-start car "
+            "will be removed from active scheduling.\n\n"
+            "Anki Undo / Ctrl+Z will not restore the previous car timeline state. To undo the car "
+            "change, use ADR Helper > Manage cars > Manually manage cars > Undo last car change."
+        ):
             return
-        _archive_active_car(str(car.get("id")), reason="graduated")
+        _drive_car_to_timeline_start(str(car.get("id")))
         self._refresh_table()
 
     def _delete_selected(self) -> None:
@@ -1782,6 +1854,367 @@ class ManageCarsDialog(QDialog):
             return
         _archive_active_car(str(car.get("id")), reason="deleted")
         self._refresh_table()
+
+
+class PolicyEditDialog(QDialog):
+    def __init__(self, car: dict[str, Any]) -> None:
+        super().__init__(mw)
+        self.car = car
+        self.policies: list[dict[str, Any]] = []
+        self.setWindowTitle(f"{ADDON_TITLE} - Edit car parameters")
+        self.resize(920, 520)
+
+        layout = QVBoxLayout(self)
+        label = QLabel(
+            f"Editing car {_short_car_id(car)} at {_car_position_label(car)}.",
+            self,
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        source_policies = [p for p in car.get("policies", []) if isinstance(p, dict)]
+        self.table = QTableWidget(len(source_policies), 6, self)
+        self.table.setHorizontalHeaderLabels(
+            ["Deck preset", "Mode", "ADR_FLAT", "ADR_S_MULTI", "ADR_D_MULTI", "Fixed DR %"]
+        )
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table, 1)
+
+        for row_index, policy in enumerate(source_policies):
+            preset_item = QTableWidgetItem(str(policy.get("preset_name") or policy.get("preset_id") or "Preset"))
+            preset_item.setFlags(_readonly_item_flags(preset_item))
+            preset_item.setData(_qt_user_role(), policy)
+            self.table.setItem(row_index, 0, preset_item)
+
+            mode_combo = QComboBox(self.table)
+            for mode in (
+                POLICY_MODE_ADR,
+                POLICY_MODE_FIXED_DR,
+                POLICY_MODE_NORMAL_ANKI,
+            ):
+                mode_combo.addItem(POLICY_MODE_LABELS[mode], mode)
+            mode = str(policy.get("mode", POLICY_MODE_ADR))
+            for index in range(mode_combo.count()):
+                if mode_combo.itemData(index) == mode:
+                    mode_combo.setCurrentIndex(index)
+                    break
+            self.table.setCellWidget(row_index, 1, mode_combo)
+
+            adr = policy.get("adr") if isinstance(policy.get("adr"), dict) else {}
+            for col, key in enumerate(("flat", "s_multi", "d_multi"), start=2):
+                spin = NoWheelDoubleSpinBox(self.table)
+                spin.setRange(-1_000_000.0, 1_000_000.0)
+                spin.setDecimals(6)
+                spin.setSingleStep(0.01)
+                spin.setKeyboardTracking(False)
+                spin.setValue(float(adr.get(key, 0.0) or 0.0))
+                self.table.setCellWidget(row_index, col, spin)
+
+            fixed = NoWheelDoubleSpinBox(self.table)
+            fixed.setRange(1.0, 99.5)
+            fixed.setDecimals(2)
+            fixed.setSingleStep(1.0)
+            fixed.setKeyboardTracking(False)
+            fixed.setValue(float(policy.get("fixed_dr", 0.9) or 0.9) * 100.0)
+            self.table.setCellWidget(row_index, 5, fixed)
+
+        self.table.resizeColumnsToContents()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel", self)
+        save = QPushButton("Save", self)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+        qconnect(cancel.clicked, self.reject)
+        qconnect(save.clicked, self._accept)
+
+    def _accept(self) -> None:
+        if bool(_addon_config().get("warn_before_editing_saved_adr_parameters", True)):
+            if not _confirm("Edit saved ADR parameters for this car?"):
+                return
+        try:
+            self.policies = self._read_policies()
+        except Exception as exc:
+            showWarning(str(exc), title=ADDON_TITLE)
+            return
+        self.accept()
+
+    def _read_policies(self) -> list[dict[str, Any]]:
+        policies = []
+        for row_index in range(self.table.rowCount()):
+            item = self.table.item(row_index, 0)
+            original = item.data(_qt_user_role()) if item is not None else None
+            if not isinstance(original, dict):
+                continue
+            policy = dict(original)
+            mode_combo = self.table.cellWidget(row_index, 1)
+            fixed_widget = self.table.cellWidget(row_index, 5)
+            if not isinstance(mode_combo, QComboBox) or not isinstance(fixed_widget, QDoubleSpinBox):
+                raise ValueError("Policy widgets missing.")
+            policy["mode"] = str(mode_combo.currentData() or POLICY_MODE_ADR)
+            policy["fixed_dr"] = float(fixed_widget.value()) / 100.0
+            adr = {}
+            for col, key in enumerate(("flat", "s_multi", "d_multi"), start=2):
+                widget = self.table.cellWidget(row_index, col)
+                if not isinstance(widget, QDoubleSpinBox):
+                    raise ValueError("ADR parameter widget missing.")
+                adr[key] = float(widget.value())
+            policy["adr"] = adr
+            policies.append(policy)
+        return policies
+
+
+class SchedulingOperationDialog(QDialog):
+    def __init__(self, operation: str, deck_id: int | None) -> None:
+        super().__init__(mw)
+        self.operation = operation
+        self.deck_id = deck_id
+        self.preview = _build_scheduling_preview(deck_id)
+        self.options: dict[str, Any] | None = None
+        self._due_count_cache: dict[int, int] = {}
+
+        title = {
+            "filtered": "Generate filtered deck",
+            "reschedule": "Reschedule all cards",
+            "manage": "Manage cars",
+        }.get(operation, "Scheduling")
+        self.setWindowTitle(f"{ADDON_TITLE} - {title}")
+        self.resize(720, 520)
+
+        layout = QVBoxLayout(self)
+        scope_label = QLabel(f"Scope: {_deck_scope_label(deck_id)}", self)
+        scope_label.setWordWrap(True)
+        layout.addWidget(scope_label)
+
+        oldest = self.preview.get("drive_car") or self.preview.get("oldest_car")
+        if isinstance(oldest, dict):
+            car_text = f"Oldest car: {_short_car_id(oldest)} at {_car_position_label(oldest)}"
+        else:
+            car_text = "No active car is available for this scope."
+        car_label = QLabel(car_text, self)
+        car_label.setWordWrap(True)
+        layout.addWidget(car_label)
+
+        form = QFormLayout()
+        self.name: QLineEdit | None = None
+        self.order: QComboBox | None = None
+        self.reschedule_reviews: QCheckBox | None = None
+        if operation == "filtered":
+            config = _addon_config()
+            self.name = QLineEdit(self)
+            self.name.setText(_default_filtered_deck_name(deck_id))
+            form.addRow("Deck name", self.name)
+
+            self.order = QComboBox(self)
+            order_labels = _filtered_deck_order_labels()
+            for index, label in enumerate(order_labels):
+                self.order.addItem(label, index)
+            saved_order = str(config.get("filtered_deck_order", "Due"))
+            for index, label in enumerate(order_labels):
+                if saved_order.casefold() in label.casefold() or label.casefold() in saved_order.casefold():
+                    self.order.setCurrentIndex(index)
+                    break
+            form.addRow("Sort order", self.order)
+
+            self.reschedule_reviews = QCheckBox(self)
+            self.reschedule_reviews.setChecked(bool(config.get("filtered_deck_reschedule", True)))
+            form.addRow("Reschedule reviews", self.reschedule_reviews)
+
+        self.slider_panel = QWidget(self)
+        slider_layout = QVBoxLayout(self.slider_panel)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        self.slider = QSlider(_qt_horizontal(), self.slider_panel)
+        slider_max = _drive_slider_max_value(self.preview)
+        self.slider.setRange(0, slider_max)
+        self.slider.setValue(slider_max)
+        self.slider.setEnabled(isinstance(self.preview.get("drive_car"), dict) and slider_max > 0)
+        self.slider_label = QLabel("", self.slider_panel)
+        self.slider_label.setWordWrap(True)
+        slider_layout.addWidget(self.slider)
+        slider_layout.addWidget(self.slider_label)
+        form.addRow("Car position", self.slider_panel)
+
+        self.landing_date = QLabel("", self)
+        form.addRow("Car landing date", self.landing_date)
+        self.due_today = QLabel("", self)
+        form.addRow("Reviews due today", self.due_today)
+        layout.addLayout(form)
+
+        tool_buttons = QHBoxLayout()
+        visualize = QPushButton("Visualize future workload", self)
+        live = QPushButton("Open LIVE interactive workload visualizer", self)
+        edit = QPushButton("Edit oldest car parameters", self)
+        tool_buttons.addWidget(visualize)
+        tool_buttons.addWidget(live)
+        tool_buttons.addWidget(edit)
+        layout.addLayout(tool_buttons)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel", self)
+        accept_label = {
+            "filtered": "Generate",
+            "reschedule": "Reschedule",
+            "manage": "Apply car move",
+        }.get(operation, "Continue")
+        accept = QPushButton(accept_label, self)
+        buttons.addWidget(cancel)
+        buttons.addWidget(accept)
+        layout.addLayout(buttons)
+
+        qconnect(self.slider.valueChanged, self._slider_changed)
+        if self.order is not None:
+            qconnect(self.order.currentIndexChanged, self._update_position_summary)
+        qconnect(visualize.clicked, self._visualize)
+        qconnect(live.clicked, self._live_visualizer)
+        qconnect(edit.clicked, self._edit_oldest_car)
+        qconnect(cancel.clicked, self.reject)
+        qconnect(accept.clicked, self._accept)
+
+        self._update_position_summary()
+
+    def _slider_changed(self, value: int) -> None:
+        self._update_position_summary()
+
+    def _order_label(self) -> str:
+        if self.order is not None:
+            return self.order.currentText()
+        return "Order due"
+
+    def _current_move(self) -> dict[str, Any] | None:
+        return _preview_move_for_slider_value(self.preview, int(self.slider.value()))
+
+    def _due_today_for_value(self, value: int) -> int:
+        value = int(value)
+        if value in self._due_count_cache:
+            return self._due_count_cache[value]
+        move = _preview_move_for_slider_value(self.preview, value)
+        cars = _project_cars_with_moves(self.preview.get("cars", []), [move] if move else [])
+        count = _projected_due_today_count(self.preview, cars)
+        self._due_count_cache[value] = count
+        return count
+
+    def _update_position_summary(self, *_args: Any) -> None:
+        value = int(self.slider.value())
+        landing = _preview_landing_label(self.preview, value)
+        due_today = self._due_today_for_value(value)
+        current_due = int(self.preview.get("current_due_count", 0))
+        if isinstance(self.preview.get("drive_car"), dict):
+            if value <= 0:
+                position_text = "Timeline start"
+            elif value >= self.slider.maximum():
+                position_text = "Current position"
+            else:
+                position_text = f"{landing}"
+            self.slider_label.setText(
+                f"{position_text} ({current_due} due now, {due_today} due after this position)"
+            )
+        else:
+            self.slider_label.setText("No driveable car is available; previewing the current scheduler.")
+        move = self._current_move()
+        if move:
+            self.landing_date.setText(landing)
+        else:
+            self.landing_date.setText("No movement")
+        self.due_today.setText(str(due_today))
+
+    def _options_from_ui(self) -> dict[str, Any]:
+        move = self._current_move()
+        car_moves = [move] if move else []
+        options: dict[str, Any] = {
+            "car_moves": car_moves,
+            "order_label": self._order_label(),
+            "landing_label": _preview_landing_label(self.preview, int(self.slider.value())),
+            "due_today": self._due_today_for_value(int(self.slider.value())),
+        }
+        if self.operation == "filtered":
+            assert self.name is not None
+            assert self.order is not None
+            assert self.reschedule_reviews is not None
+            options.update(
+                {
+                    "name": self.name.text().strip() or _default_filtered_deck_name(self.deck_id),
+                    "order_index": int(self.order.currentData() or 0),
+                    "order_label": self.order.currentText(),
+                    "reschedule": self.reschedule_reviews.isChecked(),
+                }
+            )
+        return options
+
+    def _accept(self) -> None:
+        move = self._current_move()
+        if _move_is_timeline_start(move) and not _confirm_timeline_start_move(self.operation):
+            return
+        config = _addon_config()
+        if self.operation == "filtered":
+            assert self.order is not None
+            assert self.reschedule_reviews is not None
+            config["filtered_deck_order"] = self.order.currentText()
+            config["filtered_deck_reschedule"] = self.reschedule_reviews.isChecked()
+        _write_addon_config(config)
+        self.options = self._options_from_ui()
+        self.accept()
+
+    def _projected_cars(self) -> list[dict[str, Any]]:
+        return _project_cars_with_moves(self.preview.get("cars", []), self._options_from_ui().get("car_moves", []))
+
+    def _visualize(self) -> None:
+        cars = self._projected_cars()
+        value = int(self.slider.value())
+        snapshot = _workload_snapshot(
+            self.deck_id,
+            cars,
+            f"{_preview_landing_label(self.preview, value)} | {self._due_today_for_value(value)} due today",
+        )
+        _show_workload_graph_dialog([snapshot], title="ADR future workload")
+
+    def _live_visualizer(self) -> None:
+        default = int(_addon_config().get("workload_visualizer_subdivisions", 20) or 20)
+        count, ok = QInputDialog.getInt(
+            self,
+            ADDON_TITLE,
+            "How many date subdivisions to make?",
+            default,
+            2,
+            200,
+            1,
+        )
+        if not ok:
+            return
+        config = _addon_config()
+        config["workload_visualizer_subdivisions"] = int(count)
+        _write_addon_config(config)
+
+        snapshots = []
+        values = _date_slider_subdivision_values(self.preview, count)
+        for value in values:
+            move = _preview_move_for_slider_value(self.preview, value)
+            cars = _project_cars_with_moves(self.preview.get("cars", []), [move] if move else [])
+            landing = _preview_landing_label(self.preview, value)
+            due_today = _projected_due_today_count(self.preview, cars)
+            snapshots.append(_workload_snapshot(self.deck_id, cars, f"{landing} | {due_today} due today"))
+        _show_workload_graph_dialog(snapshots, title="ADR live workload visualizer")
+
+    def _edit_oldest_car(self) -> None:
+        car = _oldest_drive_car(_active_cars()) or _oldest_scheduling_car()
+        if car is None:
+            showWarning("No active car found.", title=ADDON_TITLE)
+            return
+        dialog = PolicyEditDialog(car)
+        if _exec_dialog(dialog) != 1:
+            return
+        if _update_active_car(str(car.get("id")), {"policies": dialog.policies}):
+            _show_info(f"Updated car {_short_car_id(car)}.")
+            self.preview = _build_scheduling_preview(self.deck_id)
+            self._due_count_cache.clear()
+            slider_max = _drive_slider_max_value(self.preview)
+            self.slider.setRange(0, slider_max)
+            self.slider.setValue(slider_max)
+            self.slider.setEnabled(isinstance(self.preview.get("drive_car"), dict) and slider_max > 0)
+            self._update_position_summary()
 
 
 def config_for_quality(name: str) -> dict[str, Any]:
@@ -2299,6 +2732,7 @@ def _make_car(policies: list[dict[str, Any]], export_path: Path) -> dict[str, An
         "id": str(uuid.uuid4()),
         "created_at": now,
         "position_date": dt.date.today().isoformat(),
+        "position_kind": "date",
         "optimization_event_id": event_id,
         "created_by": "optimizer",
         "export_path": str(export_path),
@@ -2309,6 +2743,22 @@ def _make_car(policies: list[dict[str, Any]], export_path: Path) -> dict[str, An
 def _save_new_car(car: dict[str, Any]) -> None:
     data = _load_cars()
     data["active_cars"].append(car)
+    _write_cars(data)
+
+
+def _save_new_car_with_undo(car: dict[str, Any]) -> None:
+    data = _load_cars()
+    before = _clone_jsonable(data.get("active_cars", []))
+    data["active_cars"].append(car)
+    _append_transaction_to_data(
+        data,
+        {
+            "type": "create_car",
+            "active_cars_before": before,
+            "active_cars_after": _clone_jsonable(data.get("active_cars", [])),
+            "car_id": str(car.get("id", "")),
+        },
+    )
     _write_cars(data)
 
 
@@ -2337,6 +2787,83 @@ def _archive_active_car(
     return True
 
 
+def _drive_car_to_timeline_start(car_id: str) -> bool:
+    data = _load_cars()
+    active = [car for car in data.get("active_cars", []) if isinstance(car, dict)]
+    before = _clone_jsonable(active)
+    selected: dict[str, Any] | None = None
+    kept: list[dict[str, Any]] = []
+    replaced: list[dict[str, Any]] = []
+
+    for car in active:
+        if str(car.get("id")) == car_id:
+            selected = dict(car)
+            continue
+        if _is_timeline_start_car(car):
+            replaced.append(dict(car))
+            continue
+        kept.append(car)
+
+    if selected is None:
+        return False
+
+    selected["position_kind"] = CAR_POSITION_KIND_TIMELINE_START
+    selected["position_date"] = "timeline-start"
+    selected["timeline_started_at"] = _now_iso()
+    kept.append(selected)
+
+    if replaced and bool(_addon_config().get("track_adr_optimization_history", True)):
+        for car in replaced:
+            car["archived_at"] = _now_iso()
+            car["archive_reason"] = "replaced_timeline_start"
+            data.setdefault("history", []).append(car)
+
+    data["active_cars"] = kept
+    _append_transaction_to_data(
+        data,
+        {
+            "type": "drive_to_timeline_start",
+            "active_cars_before": before,
+            "active_cars_after": _clone_jsonable(kept),
+            "car_id": car_id,
+            "replaced_car_ids": [str(car.get("id", "")) for car in replaced],
+        },
+    )
+    _write_cars(data)
+    return True
+
+
+def _undo_last_car_state_transaction() -> bool:
+    data = _load_cars()
+    transactions = data.get("transactions", [])
+    if not isinstance(transactions, list):
+        return False
+
+    for index in range(len(transactions) - 1, -1, -1):
+        transaction = transactions[index]
+        if not isinstance(transaction, dict):
+            continue
+        if transaction.get("undone_at"):
+            continue
+        before = transaction.get("active_cars_before")
+        if not isinstance(before, list):
+            continue
+        data["active_cars"] = _clone_jsonable(before)
+        transaction["undone_at"] = _now_iso()
+        undo_transaction = {
+            "id": str(uuid.uuid4()),
+            "type": "undo_car_state",
+            "created_at": _now_iso(),
+            "undid_transaction_id": str(transaction.get("id", "")),
+            "undid_transaction_type": str(transaction.get("type", "")),
+            "active_cars_after": _clone_jsonable(before),
+        }
+        data.setdefault("transactions", []).append(undo_transaction)
+        _write_cars(data)
+        return True
+    return False
+
+
 def _update_active_car(car_id: str, updates: dict[str, Any]) -> bool:
     data = _load_cars()
     changed = False
@@ -2352,8 +2879,19 @@ def _update_active_car(car_id: str, updates: dict[str, Any]) -> bool:
 
 def _append_car_transaction(transaction: dict[str, Any]) -> None:
     data = _load_cars()
-    data.setdefault("transactions", []).append(transaction)
+    _append_transaction_to_data(data, transaction)
     _write_cars(data)
+
+
+def _append_transaction_to_data(data: dict[str, Any], transaction: dict[str, Any]) -> None:
+    entry = dict(transaction)
+    entry.setdefault("id", str(uuid.uuid4()))
+    entry.setdefault("created_at", _now_iso())
+    data.setdefault("transactions", []).append(entry)
+
+
+def _clone_jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
 
 
 def _active_cars() -> list[dict[str, Any]]:
@@ -2371,6 +2909,51 @@ def _short_car_id(car: dict[str, Any]) -> str:
     return str(car.get("id", ""))[:8] or "(missing)"
 
 
+def _is_timeline_start_car(car: dict[str, Any]) -> bool:
+    return str(car.get("position_kind", "")).casefold() == CAR_POSITION_KIND_TIMELINE_START
+
+
+def _car_position_day(car: dict[str, Any]) -> int | None:
+    if _is_timeline_start_car(car):
+        return -1_000_000_000
+    return _position_date_to_anki_day(str(car.get("position_date", "")))
+
+
+def _car_position_label(car: dict[str, Any]) -> str:
+    if _is_timeline_start_car(car):
+        return "Timeline start"
+    return str(car.get("position_date", ""))
+
+
+def _driveable_cars(cars: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    source = cars if cars is not None else _active_cars()
+    return [car for car in source if not _is_timeline_start_car(car)]
+
+
+def _oldest_scheduling_car(cars: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    valid = []
+    for car in cars if cars is not None else _active_cars():
+        position_day = _car_position_day(car)
+        if position_day is not None:
+            valid.append((position_day, str(car.get("created_at", "")), str(car.get("id", "")), car))
+    if not valid:
+        return None
+    valid.sort(key=lambda item: (item[0], item[1], item[2]))
+    return valid[0][3]
+
+
+def _latest_position_car(cars: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    valid = []
+    for car in cars if cars is not None else _active_cars():
+        position_day = _car_position_day(car)
+        if position_day is not None:
+            valid.append((position_day, str(car.get("created_at", "")), str(car.get("id", "")), car))
+    if not valid:
+        return None
+    valid.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return valid[0][3]
+
+
 def _policy_for_card(
     preset_id: int | None,
     preset_name: str,
@@ -2379,7 +2962,7 @@ def _policy_for_card(
 ) -> dict[str, Any] | None:
     matches = []
     for car in cars if cars is not None else _active_cars():
-        position_day = _position_date_to_anki_day(str(car.get("position_date", "")))
+        position_day = _car_position_day(car)
         if position_day is None or last_review_day <= position_day:
             continue
         policy = _policy_for_preset(car, preset_id, preset_name)
@@ -2414,6 +2997,55 @@ def _policy_for_preset(
         if str(policy.get("preset_name", "")).casefold() == name_key:
             return policy
     return None
+
+
+def _policy_matches_policy(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    existing_id = _optional_int(existing.get("preset_id"))
+    incoming_id = _optional_int(incoming.get("preset_id"))
+    if existing_id is not None and incoming_id is not None:
+        return existing_id == incoming_id
+    return str(existing.get("preset_name", "")).casefold() == str(
+        incoming.get("preset_name", "")
+    ).casefold()
+
+
+def _upsert_policy_in_active_car(car_id: str, policy: dict[str, Any]) -> str | None:
+    data = _load_cars()
+    active = [car for car in data.get("active_cars", []) if isinstance(car, dict)]
+    before = _clone_jsonable(active)
+    result: str | None = None
+    for car in active:
+        if str(car.get("id")) != car_id:
+            continue
+        policies = [p for p in car.get("policies", []) if isinstance(p, dict)]
+        for index, existing in enumerate(policies):
+            if _policy_matches_policy(existing, policy):
+                policies[index] = policy
+                result = "replaced"
+                break
+        if result is None:
+            policies.append(policy)
+            result = "appended"
+        car["policies"] = policies
+        break
+
+    if result is None:
+        return None
+    data["active_cars"] = active
+    _append_transaction_to_data(
+        data,
+        {
+            "type": "upsert_policy",
+            "active_cars_before": before,
+            "active_cars_after": _clone_jsonable(active),
+            "car_id": car_id,
+            "result": result,
+            "preset_id": policy.get("preset_id"),
+            "preset_name": policy.get("preset_name"),
+        },
+    )
+    _write_cars(data)
+    return result
 
 
 def _position_date_to_anki_day(value: str) -> int | None:
@@ -2562,7 +3194,7 @@ def _soft_power_cap(interval: int, config: dict[str, Any]) -> int:
     interval = max(1, int(round(interval)))
     if not bool(config.get("enable_soft_interval_cap", True)):
         return interval
-    threshold = float(config.get("soft_interval_cap_threshold", 1000.0) or 1000.0)
+    threshold = float(config.get("soft_interval_cap_threshold", 3650.0) or 3650.0)
     power = float(config.get("soft_interval_cap_power", 0.5) or 0.5)
     if threshold <= 0 or interval <= threshold:
         return interval
@@ -2625,6 +3257,36 @@ def _exec_dialog(dialog: QDialog) -> int:
     return int(execute())
 
 
+def _prompt_date(parent: QWidget, title: str, current: str) -> str | None:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(f"{ADDON_TITLE} - {title}")
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(QLabel("Position date", dialog))
+
+    date_edit = QDateEdit(dialog)
+    date_edit.setCalendarPopup(True)
+    try:
+        parsed = dt.date.fromisoformat(current[:10])
+        date_edit.setDate(QDate(parsed.year, parsed.month, parsed.day))
+    except Exception:
+        date_edit.setDateTime(QDateTime.currentDateTime())
+    layout.addWidget(date_edit)
+
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    cancel = QPushButton("Cancel", dialog)
+    ok = QPushButton("OK", dialog)
+    buttons.addWidget(cancel)
+    buttons.addWidget(ok)
+    layout.addLayout(buttons)
+    qconnect(cancel.clicked, dialog.reject)
+    qconnect(ok.clicked, dialog.accept)
+
+    if _exec_dialog(dialog) != 1:
+        return None
+    return date_edit.date().toString("yyyy-MM-dd")
+
+
 def _message_icon(name: str) -> Any:
     enum = getattr(QMessageBox, "Icon", QMessageBox)
     return getattr(enum, name)
@@ -2633,6 +3295,11 @@ def _message_icon(name: str) -> Any:
 def _button_role(name: str) -> Any:
     enum = getattr(QMessageBox, "ButtonRole", QMessageBox)
     return getattr(enum, name)
+
+
+def _qt_horizontal() -> Any:
+    enum = getattr(Qt, "Orientation", Qt)
+    return getattr(enum, "Horizontal")
 
 
 def _load_export_rows(path: Path) -> list[dict[str, Any]]:
@@ -2713,7 +3380,7 @@ def _review_batch_optimizer_result(
         return False
     try:
         car = _make_car(review.policies, request.export_path)
-        _save_new_car(car)
+        _save_new_car_with_undo(car)
     except Exception as exc:
         showWarning(f"Could not save car:\n{exc}", title=ADDON_TITLE)
         return False
@@ -2733,10 +3400,14 @@ def _optimize_adr_parameters() -> None:
         showWarning(str(exc), title=ADDON_TITLE)
         return
 
-    if _active_cars() and bool(
+    if _driveable_cars() and bool(
         _addon_config().get("warn_before_creating_new_car_when_active_exists", True)
     ):
-        if not _confirm("There is already an active car. Create another car anyway?"):
+        if not _confirm(
+            "There is already a car that has not reached timeline start. "
+            "It is usually better to drive it to timeline start before optimizing new ADR parameters. "
+            "Create another car anyway?"
+        ):
             return
 
     dialog = BatchOptimizeDialog(export_path, rows)
@@ -2803,12 +3474,13 @@ def _reschedule_all_cards_for_scope(deck_id: int | None) -> None:
     if not _active_cars():
         showWarning("No active cars found. Optimize ADR parameters first.", title=ADDON_TITLE)
         return
-    scope = _deck_scope_label(deck_id)
-    if not _confirm(f"Reschedule review cards for {scope} using active car policies?"):
+    dialog = SchedulingOperationDialog("reschedule", deck_id)
+    if _exec_dialog(dialog) != 1 or dialog.options is None:
         return
+    options = dialog.options
 
     def task() -> dict[str, Any]:
-        return _reschedule_cards(deck_id)
+        return _reschedule_cards(deck_id, options)
 
     def done(future: Any) -> None:
         try:
@@ -2823,7 +3495,8 @@ def _reschedule_all_cards_for_scope(deck_id: int | None) -> None:
         _show_info(
             "ADR reschedule complete.\n\n"
             f"Updated cards: {result['updated']}\n"
-            f"Skipped cards: {result['skipped']}"
+            f"Skipped cards: {result['skipped']}\n"
+            f"Moved cars: {result.get('moved', 0)}"
         )
 
     mw.taskman.with_progress(
@@ -2862,15 +3535,157 @@ def _show_result(result: OptimizerRunResult, log: str) -> None:
 
     buttons = QHBoxLayout()
     buttons.addStretch(1)
+    create_car = QPushButton("Create car", dialog)
+    append_policy = QPushButton("Append policy to latest car", dialog)
     open_folder = QPushButton("Open output folder", dialog)
     close = QPushButton("Close", dialog)
+    buttons.addWidget(create_car)
+    buttons.addWidget(append_policy)
     buttons.addWidget(open_folder)
     buttons.addWidget(close)
     layout.addLayout(buttons)
 
+    can_save_policy = result.summary_path.exists()
+    create_car.setEnabled(can_save_policy)
+    append_policy.setEnabled(can_save_policy)
+    qconnect(create_car.clicked, lambda: _create_car_from_summary(result.summary_path, dialog))
+    qconnect(append_policy.clicked, lambda: _append_policy_from_summary(result.summary_path, dialog))
     qconnect(open_folder.clicked, _open_output_folder)
     qconnect(close.clicked, dialog.accept)
     _exec_dialog(dialog)
+
+
+def _summary_policy_choices(summary_path: Path) -> tuple[dict[str, Any], list[str]] | None:
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        showWarning(f"Could not read optimizer summary:\n{exc}", title=ADDON_TITLE)
+        return None
+    selected = summary.get("selected")
+    if not isinstance(selected, dict):
+        showWarning("The optimizer summary does not include selectable policies.", title=ADDON_TITLE)
+        return None
+    labels = [label for label in ("Recommended", "Aggressive", "Calm") if isinstance(selected.get(label), dict)]
+    if not labels:
+        showWarning("No Recommended, Aggressive, or Calm policy was found in the summary.", title=ADDON_TITLE)
+        return None
+    return summary, labels
+
+
+def _choose_policy_from_summary(summary_path: Path, parent: QWidget) -> dict[str, Any] | None:
+    choices = _summary_policy_choices(summary_path)
+    if choices is None:
+        return None
+    summary, labels = choices
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(f"{ADDON_TITLE} - Choose policy")
+    layout = QVBoxLayout(dialog)
+    preset = summary.get("preset", {})
+    preset_name = str(preset.get("name") if isinstance(preset, dict) else "") or "Preset"
+    layout.addWidget(QLabel(f"Deck preset: {preset_name}", dialog))
+
+    combo = QComboBox(dialog)
+    for label in labels:
+        combo.addItem(label, label)
+    layout.addWidget(combo)
+
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    cancel = QPushButton("Cancel", dialog)
+    use = QPushButton("Use policy", dialog)
+    buttons.addWidget(cancel)
+    buttons.addWidget(use)
+    layout.addLayout(buttons)
+    qconnect(cancel.clicked, dialog.reject)
+    qconnect(use.clicked, dialog.accept)
+
+    if _exec_dialog(dialog) != 1:
+        return None
+    label = str(combo.currentData() or labels[0])
+    return _policy_from_single_summary(summary, label, summary_path)
+
+
+def _policy_from_single_summary(
+    summary: dict[str, Any],
+    label: str,
+    summary_path: Path,
+) -> dict[str, Any] | None:
+    selected = summary.get("selected")
+    point = selected.get(label) if isinstance(selected, dict) else None
+    if not isinstance(point, dict):
+        showWarning(f"The {label} policy is missing from this summary.", title=ADDON_TITLE)
+        return None
+    preset = summary.get("preset", {})
+    if not isinstance(preset, dict):
+        preset = {}
+    try:
+        adr = {
+            "flat": float(point["flat"]),
+            "s_multi": float(point["s_multi"]),
+            "d_multi": float(point["d_multi"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        showWarning(f"Could not read {label} ADR parameters:\n{exc}", title=ADDON_TITLE)
+        return None
+    return {
+        "preset_id": _optional_int(preset.get("id")),
+        "preset_name": str(preset.get("name") or "Preset"),
+        "deck_ids": [],
+        "mode": POLICY_MODE_ADR,
+        "fixed_dr": float(summary.get("target_dr", 0.9) or 0.9),
+        "adr": adr,
+        "optimizer_metadata": {
+            "selection": label.casefold(),
+            "selection_label": label,
+            "target_dr": summary.get("target_dr"),
+            "export_path": str(summary.get("export") or ""),
+            "summary_path": str(summary_path),
+            "created_from": "single_pareto_plot",
+        },
+    }
+
+
+def _create_car_from_summary(summary_path: Path, parent: QWidget) -> None:
+    policy = _choose_policy_from_summary(summary_path, parent)
+    if policy is None:
+        return
+    export_path = Path(str(policy.get("optimizer_metadata", {}).get("export_path") or ""))
+    car = _make_car([policy], export_path)
+    car["created_by"] = "pareto_plot"
+    _save_new_car_with_undo(car)
+    _show_info(f"Saved car {_short_car_id(car)} with the {policy['optimizer_metadata']['selection_label']} policy.")
+
+
+def _append_policy_from_summary(summary_path: Path, parent: QWidget) -> None:
+    policy = _choose_policy_from_summary(summary_path, parent)
+    if policy is None:
+        return
+    latest = _latest_position_car()
+    if latest is None:
+        showWarning("No active car found. Create a car first.", title=ADDON_TITLE)
+        return
+
+    existing = _policy_for_preset(
+        latest,
+        _optional_int(policy.get("preset_id")),
+        str(policy.get("preset_name", "")),
+    )
+    if existing is not None:
+        if not _confirm(
+            "The latest-position car already has a policy for this preset.\n\n"
+            "Append policy to latest car is intended for adding separate presets manually. "
+            "If you intended to start a new scheduling era, use Create car instead.\n\n"
+            "Replace the existing preset policy in the latest-position car?"
+        ):
+            return
+
+    result = _upsert_policy_in_active_car(str(latest.get("id")), policy)
+    if result is None:
+        showWarning("Could not update the latest-position car.", title=ADDON_TITLE)
+        return
+    verb = "Replaced" if result == "replaced" else "Appended"
+    _show_info(f"{verb} policy on car {_short_car_id(latest)}.")
 
 
 def _set_report_html(web: AnkiWebView, plot_path: Path) -> None:
@@ -2960,66 +3775,320 @@ def _open_output_folder() -> None:
         showWarning(f"Could not open output folder:\n{OUTPUTS_DIR}", title=ADDON_TITLE)
 
 
-def _prompt_filtered_deck_options(deck_id: int | None) -> dict[str, Any] | None:
+def _build_scheduling_preview(deck_id: int | None) -> dict[str, Any]:
     config = _addon_config()
-    dialog = QDialog(mw)
-    dialog.setWindowTitle(f"{ADDON_TITLE} - Generate filtered deck")
-    dialog.resize(520, 260)
-    layout = QVBoxLayout(dialog)
-    layout.addWidget(QLabel(f"Scope: {_deck_scope_label(deck_id)}", dialog))
+    cars = _active_cars()
+    today = int(mw.col.sched.today)
+    candidate_rows = _candidate_card_rows(deck_id)
+    due_rows, skipped = _due_rows_under_cars(candidate_rows, cars, today, config)
+    drive_car = _oldest_drive_car(cars)
+    drive_min_day: int | None = None
+    drive_max_day: int | None = None
+    if isinstance(drive_car, dict):
+        drive_max_day = _car_position_day(drive_car)
+        if drive_max_day is not None:
+            eligible_days = [
+                int(row["last_review_day"])
+                for row in candidate_rows
+                if int(row["last_review_day"]) <= drive_max_day
+                and _policy_for_preset(drive_car, row["preset_id"], row["preset_name"]) is not None
+            ]
+            drive_min_day = min(eligible_days) - 1 if eligible_days else drive_max_day
+            if drive_min_day > drive_max_day:
+                drive_min_day = drive_max_day
+    return {
+        "cars": cars,
+        "today": today,
+        "candidate_rows": candidate_rows,
+        "due_rows": due_rows,
+        "skipped": skipped,
+        "current_due_count": min(len(due_rows), 9999),
+        "drive_car": drive_car,
+        "drive_min_day": drive_min_day,
+        "drive_max_day": drive_max_day,
+        "oldest_car": _oldest_scheduling_car(cars),
+    }
 
-    form = QFormLayout()
-    name = QLineEdit(dialog)
-    name.setText(_default_filtered_deck_name(deck_id))
-    limit = QSpinBox(dialog)
-    limit.setRange(1, 50_000)
-    limit.setValue(int(config.get("filtered_deck_limit", 100)))
-    order = QComboBox(dialog)
-    order_labels = _filtered_deck_order_labels()
-    for index, label in enumerate(order_labels):
-        order.addItem(label, index)
-    saved_order = str(config.get("filtered_deck_order", "Due"))
-    for index, label in enumerate(order_labels):
-        if saved_order.casefold() in label.casefold() or label.casefold() in saved_order.casefold():
-            order.setCurrentIndex(index)
-            break
-    reschedule = QCheckBox(dialog)
-    reschedule.setChecked(bool(config.get("filtered_deck_reschedule", True)))
-    drive_backward = QCheckBox(dialog)
-    drive_backward.setChecked(bool(config.get("filtered_deck_drive_backward", True)))
-    form.addRow("Deck name", name)
-    form.addRow("Card limit", limit)
-    form.addRow("Sort order", order)
-    form.addRow("Reschedule reviews", reschedule)
-    form.addRow("Drive oldest car backward if needed", drive_backward)
-    layout.addLayout(form)
+
+def _drive_slider_max_value(preview: dict[str, Any]) -> int:
+    min_day = preview.get("drive_min_day")
+    max_day = preview.get("drive_max_day")
+    if min_day is None or max_day is None:
+        return 0
+    return max(0, int(max_day) - int(min_day) + 1)
+
+
+def _preview_day_for_slider_value(preview: dict[str, Any], value: int) -> int | None:
+    if int(value) <= 0:
+        return None
+    min_day = preview.get("drive_min_day")
+    max_day = preview.get("drive_max_day")
+    if min_day is None or max_day is None:
+        return None
+    bounded = max(1, min(_drive_slider_max_value(preview), int(value)))
+    return max(int(min_day), min(int(max_day), int(min_day) + bounded - 1))
+
+
+def _preview_landing_label(preview: dict[str, Any], value: int) -> str:
+    car = preview.get("drive_car")
+    if not isinstance(car, dict):
+        return "Current schedule"
+    if int(value) <= 0:
+        return "Timeline start"
+    day = _preview_day_for_slider_value(preview, value)
+    if day is None:
+        return "No movement"
+    date = _anki_day_to_date(day)
+    if day == preview.get("drive_max_day"):
+        return f"Current position ({date})"
+    return date
+
+
+def _preview_move_for_slider_value(preview: dict[str, Any], value: int) -> dict[str, Any] | None:
+    car = preview.get("drive_car")
+    if not isinstance(car, dict):
+        return None
+    if int(value) <= 0:
+        return {
+            "car_id": str(car.get("id")),
+            "short_id": _short_car_id(car),
+            "position_kind": CAR_POSITION_KIND_TIMELINE_START,
+            "old_position_date": str(car.get("position_date", "")),
+            "new_position_date": "timeline-start",
+            "new_position_label": "Timeline start",
+        }
+    new_position_day = _preview_day_for_slider_value(preview, value)
+    current_day = preview.get("drive_max_day")
+    if new_position_day is None or current_day is None or int(new_position_day) >= int(current_day):
+        return None
+    return {
+        "car_id": str(car.get("id")),
+        "short_id": _short_car_id(car),
+        "position_kind": "date",
+        "old_position_date": str(car.get("position_date", "")),
+        "new_position_date": _anki_day_to_date(new_position_day),
+        "new_position_day": int(new_position_day),
+        "new_position_label": _anki_day_to_date(new_position_day),
+    }
+
+
+def _date_slider_subdivision_values(preview: dict[str, Any], count: int) -> list[int]:
+    maximum = _drive_slider_max_value(preview)
+    if maximum <= 0:
+        return [0]
+    count = max(2, int(count))
+    values = {
+        int(round(maximum * index / max(1, count - 1)))
+        for index in range(count)
+    }
+    values.add(0)
+    values.add(maximum)
+    return sorted(values, reverse=True)
+
+
+def _move_is_timeline_start(move: dict[str, Any] | None) -> bool:
+    return isinstance(move, dict) and str(move.get("position_kind", "")).casefold() == CAR_POSITION_KIND_TIMELINE_START
+
+
+def _projected_due_today_count(preview: dict[str, Any], cars: list[dict[str, Any]]) -> int:
+    due_rows, _skipped = _due_rows_under_cars(
+        [dict(row) for row in preview.get("candidate_rows", []) if isinstance(row, dict)],
+        cars,
+        int(preview.get("today", mw.col.sched.today)),
+        _addon_config(),
+    )
+    return min(len(due_rows), 9999)
+
+
+def _confirm_timeline_start_move(operation: str) -> bool:
+    undo_text = (
+        "Anki Undo / Ctrl+Z can undo the card reschedule operation, but it will not restore "
+        "the previous car timeline state."
+        if operation == "reschedule"
+        else "Anki Undo / Ctrl+Z will not restore the previous car timeline state."
+    )
+    return _confirm(
+        "Moving this car to Timeline start will replace the current baseline car.\n\n"
+        f"{undo_text}\n\n"
+        "To undo the car change, use ADR Helper > Manage cars > Manually manage cars > "
+        "Undo last car change.\n\n"
+        "Continue?"
+    )
+
+
+def _project_cars_with_moves(
+    cars: list[dict[str, Any]],
+    car_moves: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    projected = [dict(car) for car in cars]
+    moves = [move for move in car_moves or [] if isinstance(move, dict)]
+    if not moves:
+        return projected
+
+    for move in moves:
+        if not _move_is_timeline_start(move):
+            continue
+        car_id = str(move.get("car_id", ""))
+        if not car_id:
+            continue
+        next_projected = []
+        for car in projected:
+            current_id = str(car.get("id", ""))
+            if current_id == car_id:
+                car["position_kind"] = CAR_POSITION_KIND_TIMELINE_START
+                car["position_date"] = "timeline-start"
+                next_projected.append(car)
+            elif not _is_timeline_start_car(car):
+                next_projected.append(car)
+        projected = next_projected
+
+    moves_by_id = {
+        str(move.get("car_id")): str(move.get("new_position_date"))
+        for move in moves
+        if not _move_is_timeline_start(move)
+        and move.get("car_id")
+        and move.get("new_position_date")
+    }
+    if not moves_by_id:
+        return projected
+    for car in projected:
+        car_id = str(car.get("id"))
+        if car_id in moves_by_id:
+            car["position_kind"] = "date"
+            car["position_date"] = moves_by_id[car_id]
+    return projected
+
+
+def _apply_car_moves(car_moves: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    moves = [move for move in car_moves or [] if isinstance(move, dict)]
+    if not moves:
+        return []
+    data = _load_cars()
+    active = [car for car in data.get("active_cars", []) if isinstance(car, dict)]
+    before = _clone_jsonable(active)
+    applied = []
+    for move in moves:
+        if not isinstance(move, dict):
+            continue
+        car_id = str(move.get("car_id", ""))
+        if not car_id:
+            continue
+        if _move_is_timeline_start(move):
+            selected: dict[str, Any] | None = None
+            kept: list[dict[str, Any]] = []
+            replaced: list[dict[str, Any]] = []
+            for car in active:
+                if str(car.get("id")) == car_id:
+                    selected = car
+                elif _is_timeline_start_car(car):
+                    replaced.append(dict(car))
+                else:
+                    kept.append(car)
+            if selected is None:
+                continue
+            selected["position_kind"] = CAR_POSITION_KIND_TIMELINE_START
+            selected["position_date"] = "timeline-start"
+            selected["timeline_started_at"] = _now_iso()
+            kept.append(selected)
+            if replaced and bool(_addon_config().get("track_adr_optimization_history", True)):
+                for car in replaced:
+                    car["archived_at"] = _now_iso()
+                    car["archive_reason"] = "replaced_timeline_start"
+                    data.setdefault("history", []).append(car)
+            active = kept
+            applied.append(move)
+        else:
+            new_position = str(move.get("new_position_date", ""))
+            if not new_position:
+                continue
+            for car in active:
+                if str(car.get("id")) == car_id:
+                    car["position_kind"] = "date"
+                    car["position_date"] = new_position
+                    applied.append(move)
+                    break
+    if applied:
+        data["active_cars"] = active
+        _append_transaction_to_data(
+            data,
+            {
+                "type": "move_car_for_scheduling_operation",
+                "active_cars_before": before,
+                "active_cars_after": _clone_jsonable(active),
+                "car_moves": applied,
+            },
+        )
+        _write_cars(data)
+    return applied
+
+
+def _workload_snapshot(deck_id: int | None, cars: list[dict[str, Any]], label: str) -> dict[str, Any]:
+    config = _addon_config()
+    today = int(mw.col.sched.today)
+    due_counts: dict[int, int] = {}
+    daily_load = 0.0
+    for row in _candidate_card_rows(deck_id):
+        due_day = int(row.get("due", today)) - today
+        interval = int(row.get("ivl", 1) or 1)
+        policy = _policy_for_card(
+            row["preset_id"],
+            row["preset_name"],
+            row["last_review_day"],
+            cars,
+        )
+        if policy is not None:
+            card = mw.col.get_card(row["cid"])
+            target = _card_target_interval(card, policy, config)
+            if target is not None:
+                interval = int(target)
+                due_day = int(row["last_review_day"]) + interval - today
+        due_counts[due_day] = due_counts.get(due_day, 0) + 1
+        daily_load += 1.0 / max(1, interval)
+    return {
+        "label": label,
+        "due_counts": due_counts,
+        "daily_load": int(round(daily_load)),
+    }
+
+
+def _show_workload_graph_dialog(snapshots: list[dict[str, Any]], *, title: str) -> None:
+    dialog = QDialog(mw)
+    dialog.setWindowTitle(f"{ADDON_TITLE} - {title}")
+    dialog.resize(920, 620)
+    layout = QVBoxLayout(dialog)
+
+    selector = QSlider(_qt_horizontal(), dialog)
+    selector.setRange(0, max(0, len(snapshots) - 1))
+    selector.setValue(0)
+    selector.setVisible(len(snapshots) > 1)
+    label = QLabel("", dialog)
+    web = AnkiWebView(parent=dialog, title=ADDON_TITLE)
+    layout.addWidget(selector)
+    layout.addWidget(label)
+    layout.addWidget(web, 1)
 
     buttons = QHBoxLayout()
     buttons.addStretch(1)
-    cancel = QPushButton("Cancel", dialog)
-    generate = QPushButton("Generate", dialog)
-    buttons.addWidget(cancel)
-    buttons.addWidget(generate)
+    close = QPushButton("Close", dialog)
+    buttons.addWidget(close)
     layout.addLayout(buttons)
 
-    qconnect(cancel.clicked, dialog.reject)
-    qconnect(generate.clicked, dialog.accept)
+    def render(index: int) -> None:
+        snapshot = snapshots[int(index)] if snapshots else {"label": "No data", "due_counts": {}, "daily_load": 0}
+        label.setText(str(snapshot.get("label", "")))
+        web.setHtml(workload_graph_html(snapshot))
 
+    qconnect(selector.valueChanged, render)
+    qconnect(close.clicked, dialog.accept)
+    render(0)
+    _exec_dialog(dialog)
+
+
+def _prompt_filtered_deck_options(deck_id: int | None) -> dict[str, Any] | None:
+    dialog = SchedulingOperationDialog("filtered", deck_id)
     if _exec_dialog(dialog) != 1:
         return None
-    config["filtered_deck_limit"] = int(limit.value())
-    config["filtered_deck_order"] = order.currentText()
-    config["filtered_deck_reschedule"] = reschedule.isChecked()
-    config["filtered_deck_drive_backward"] = drive_backward.isChecked()
-    _write_addon_config(config)
-    return {
-        "name": name.text().strip() or _default_filtered_deck_name(deck_id),
-        "limit": int(limit.value()),
-        "order_index": int(order.currentData() or 0),
-        "order_label": order.currentText(),
-        "reschedule": reschedule.isChecked(),
-        "drive_backward": drive_backward.isChecked(),
-    }
+    return dialog.options
 
 
 def _filtered_deck_order_labels() -> list[str]:
@@ -3065,9 +4134,27 @@ def _collect_filtered_deck_cards(
     options: dict[str, Any],
 ) -> dict[str, Any]:
     config = _addon_config()
-    cars = _active_cars()
+    car_moves = [move for move in options.get("car_moves", []) if isinstance(move, dict)]
+    cars = _project_cars_with_moves(_active_cars(), car_moves)
     today = int(mw.col.sched.today)
     candidate_rows = _candidate_card_rows(deck_id)
+    due_rows, skipped = _due_rows_under_cars(candidate_rows, cars, today, config)
+    _sort_action_rows(due_rows, str(options.get("order_label", "")))
+    card_ids = [row["cid"] for row in due_rows[:9999]]
+    return {
+        "card_ids": card_ids,
+        "matched": len(due_rows),
+        "skipped": skipped,
+        "car_moves": car_moves,
+    }
+
+
+def _due_rows_under_cars(
+    candidate_rows: list[dict[str, Any]],
+    cars: list[dict[str, Any]],
+    today: int,
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
     due_rows = []
     skipped = 0
     for row in candidate_rows:
@@ -3092,93 +4179,15 @@ def _collect_filtered_deck_cards(
                     "policy_mode": policy.get("mode"),
                 }
             )
-    _sort_action_rows(due_rows, str(options.get("order_label", "")))
-    limit = int(options.get("limit", 100))
-    car_moves = []
-    if len(due_rows) < limit and bool(options.get("drive_backward", False)):
-        extra_rows, move = _extra_rows_from_driving_oldest_car(
-            candidate_rows,
-            due_rows,
-            cars,
-            today,
-            limit - len(due_rows),
-            config,
-            str(options.get("order_label", "")),
-        )
-        due_rows.extend(extra_rows)
-        if move:
-            car_moves.append(move)
-        _sort_action_rows(due_rows, str(options.get("order_label", "")))
-    card_ids = [row["cid"] for row in due_rows[:limit]]
-    return {
-        "card_ids": card_ids,
-        "matched": len(due_rows),
-        "skipped": skipped,
-        "car_moves": car_moves,
-    }
-
-
-def _extra_rows_from_driving_oldest_car(
-    candidate_rows: list[dict[str, Any]],
-    existing_due_rows: list[dict[str, Any]],
-    cars: list[dict[str, Any]],
-    today: int,
-    needed: int,
-    config: dict[str, Any],
-    order_label: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    if needed <= 0:
-        return [], None
-    car = _oldest_drive_car(cars)
-    if car is None:
-        return [], None
-    old_position_day = _position_date_to_anki_day(str(car.get("position_date", "")))
-    if old_position_day is None:
-        return [], None
-    existing_cids = {int(row["cid"]) for row in existing_due_rows}
-    extra_rows = []
-    for row in candidate_rows:
-        if int(row["cid"]) in existing_cids:
-            continue
-        if int(row["last_review_day"]) > old_position_day:
-            continue
-        policy = _policy_for_preset(car, row["preset_id"], row["preset_name"])
-        if policy is None:
-            continue
-        card = mw.col.get_card(row["cid"])
-        interval = _card_target_interval(card, policy, config)
-        if interval is None:
-            continue
-        adr_due = int(row["last_review_day"]) + int(interval)
-        if adr_due <= today:
-            extra_rows.append(
-                {
-                    **row,
-                    "target_ivl": interval,
-                    "target_due": adr_due,
-                    "policy_mode": policy.get("mode"),
-                }
-            )
-    if not extra_rows:
-        return [], None
-    _sort_action_rows(extra_rows, order_label)
-    chosen = extra_rows[:needed]
-    new_position_day = min(int(row["last_review_day"]) for row in chosen) - 1
-    old_position = str(car.get("position_date", ""))
-    new_position = _anki_day_to_date(new_position_day)
-    move = {
-        "car_id": str(car.get("id")),
-        "short_id": _short_car_id(car),
-        "old_position_date": old_position,
-        "new_position_date": new_position,
-    }
-    return chosen, move
+    return due_rows, skipped
 
 
 def _oldest_drive_car(cars: list[dict[str, Any]]) -> dict[str, Any] | None:
     valid = []
     for car in cars:
-        position_day = _position_date_to_anki_day(str(car.get("position_date", "")))
+        if _is_timeline_start_car(car):
+            continue
+        position_day = _car_position_day(car)
         if position_day is not None:
             valid.append((position_day, str(car.get("created_at", "")), car))
     if not valid:
@@ -3239,12 +4248,7 @@ def _create_filtered_deck_from_card_ids(
         return
 
     def success(out: Any) -> None:
-        applied_moves = []
-        for move in car_moves or []:
-            car_id = str(move.get("car_id", ""))
-            new_position = str(move.get("new_position_date", ""))
-            if car_id and new_position and _update_active_car(car_id, {"position_date": new_position}):
-                applied_moves.append(move)
+        applied_moves = _apply_car_moves(car_moves)
         _append_car_transaction(
             {
                 "id": str(uuid.uuid4()),
@@ -3273,9 +4277,11 @@ def _create_filtered_deck_from_card_ids(
     add_or_update_filtered_deck(parent=mw, deck=deck).success(success).run_in_background()
 
 
-def _reschedule_cards(deck_id: int | None) -> dict[str, int]:
+def _reschedule_cards(deck_id: int | None, options: dict[str, Any] | None = None) -> dict[str, int]:
     config = _addon_config()
-    cars = _active_cars()
+    options = options or {}
+    car_moves = [move for move in options.get("car_moves", []) if isinstance(move, dict)]
+    cars = _project_cars_with_moves(_active_cars(), car_moves)
     cards = []
     skipped = 0
     for row in _candidate_card_rows(deck_id):
@@ -3296,7 +4302,8 @@ def _reschedule_cards(deck_id: int | None) -> dict[str, int]:
         undo_entry = mw.col.add_custom_undo_entry("Linear ADR reschedule")
         mw.col.update_cards(cards)
         mw.col.merge_undo_entries(undo_entry)
-    return {"updated": len(cards), "skipped": skipped}
+    applied_moves = _apply_car_moves(car_moves)
+    return {"updated": len(cards), "skipped": skipped, "moved": len(applied_moves)}
 
 
 def _addon_config() -> dict[str, Any]:
@@ -3400,6 +4407,8 @@ def _would_overtake(
     high = max(old_date, new_date)
     for car in _active_cars():
         if str(car.get("id")) == car_id:
+            continue
+        if _is_timeline_start_car(car):
             continue
         try:
             other = dt.date.fromisoformat(str(car.get("position_date", ""))[:10])

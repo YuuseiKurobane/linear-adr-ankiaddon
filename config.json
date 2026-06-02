@@ -7,10 +7,9 @@
   "warn_before_allowing_car_overtaking": true,
   "warn_before_editing_saved_adr_parameters": true,
   "enable_soft_interval_cap": true,
-  "soft_interval_cap_threshold": 1000.0,
+  "soft_interval_cap_threshold": 3650.0,
   "soft_interval_cap_power": 0.5,
-  "filtered_deck_limit": 100,
   "filtered_deck_reschedule": true,
   "filtered_deck_order": "Due",
-  "filtered_deck_drive_backward": true
+  "workload_visualizer_subdivisions": 20
 }
