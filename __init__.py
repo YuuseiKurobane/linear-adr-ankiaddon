@@ -74,6 +74,8 @@ CAR_SCHEMA_VERSION = 1
 POLICY_MODE_ADR = "adr"
 POLICY_MODE_FIXED_DR = "fixed_dr"
 POLICY_MODE_NORMAL_ANKI = "normal_anki"
+CARD_CUSTOM_DATA_RESCHEDULE_KEY = "v"
+CARD_CUSTOM_DATA_RESCHEDULE_VALUE = "reschedule"
 
 POLICY_MODE_LABELS = {
     POLICY_MODE_ADR: "ADR",
@@ -2578,7 +2580,11 @@ def _update_card_due_interval(card: Any, interval: int, last_review_day: int) ->
         card.odue = new_due if new_due != 0 else 1
     else:
         card.due = new_due
-    _write_card_custom_data(card, "linear_adr", "reschedule")
+    _write_card_custom_data(
+        card,
+        CARD_CUSTOM_DATA_RESCHEDULE_KEY,
+        CARD_CUSTOM_DATA_RESCHEDULE_VALUE,
+    )
     return card
 
 
