@@ -543,6 +543,14 @@ class _QueueWriter(io.TextIOBase):
         pass
 
 
+def _queue_log(
+    out_queue: queue.Queue[tuple[str, Any]] | None,
+    text: str,
+) -> None:
+    if out_queue is not None:
+        out_queue.put(("log", text))
+
+
 class RunProgressDialog(QDialog):
     def __init__(self, request: SimulationRequest) -> None:
         super().__init__(mw)
@@ -688,6 +696,152 @@ class RunProgressDialog(QDialog):
             return
         self._graph_opened = True
         _show_result(self._result, self.log.toPlainText())
+
+
+class BatchRunProgressDialog(QDialog):
+    def __init__(self, request: BatchOptimizeRequest) -> None:
+        super().__init__(mw)
+        self._request = request
+        self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._line_buffer = ""
+        self._log_text = ""
+        self._result: BatchOptimizeResult | None = None
+        self._finished = False
+        self._saved = False
+
+        self.setWindowTitle(f"{ADDON_TITLE} - Optimize ADR Parameters")
+        self.resize(920, 640)
+
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel("Optimizing ADR parameters...", self)
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar(self)
+        self.progress.setRange(0, 0)
+        layout.addWidget(self.progress)
+
+        self.log = QPlainTextEdit(self)
+        self.log.setReadOnly(True)
+        try:
+            self.log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        except AttributeError:
+            self.log.setLineWrapMode(QPlainTextEdit.NoWrap)
+        layout.addWidget(self.log, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.review_car = QPushButton("Review car", self)
+        self.review_car.setEnabled(False)
+        self.open_outputs = QPushButton("Open output folder", self)
+        self.open_outputs.setEnabled(False)
+        self.close_button = QPushButton("Close", self)
+        self.close_button.setEnabled(False)
+        buttons.addWidget(self.review_car)
+        buttons.addWidget(self.open_outputs)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+
+        qconnect(self.review_car.clicked, self._review_result)
+        qconnect(self.open_outputs.clicked, _open_output_folder)
+        qconnect(self.close_button.clicked, self.accept)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(100)
+        qconnect(self._timer.timeout, self._drain_queue)
+        self._timer.start()
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def closeEvent(self, event: Any) -> None:
+        if not self._finished:
+            self.hide()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _run(self) -> None:
+        writer = _QueueWriter(self._queue)
+        try:
+            self._queue.put(("log", "Starting ADR parameter optimization...\n"))
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                result = run_batch_optimizer_subprocess(self._request, self._queue)
+            if result.returncode == 0:
+                self._queue.put(("done", result))
+            elif result.summary_path.exists():
+                self._queue.put(("partial", result))
+            else:
+                self._queue.put(("error", f"Batch optimizer exited with code {result.returncode}."))
+        except Exception:
+            self._queue.put(("error", traceback.format_exc()))
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                kind, payload = self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if kind == "log":
+                self._append_log(str(payload))
+            elif kind == "done":
+                self._finish(payload, partial=False)
+            elif kind == "partial":
+                self._finish(payload, partial=True)
+            elif kind == "error":
+                self._fail(str(payload))
+
+    def _append_log(self, text: str) -> None:
+        self._log_text += text
+        self._line_buffer += text.replace("\r\n", "\n").replace("\r", "\n")
+        while "\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split("\n", 1)
+            self.log.appendPlainText(line)
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def _flush_log(self) -> None:
+        if self._line_buffer:
+            self.log.appendPlainText(self._line_buffer)
+            self._line_buffer = ""
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def _finish(self, result: BatchOptimizeResult, *, partial: bool) -> None:
+        self._result = result
+        self._finished = True
+        self._timer.stop()
+        self._flush_log()
+        if partial:
+            self.status_label.setText("ADR optimization wrote a summary, but the optimizer reported an error.")
+        else:
+            self.status_label.setText("ADR optimization complete.")
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self.review_car.setEnabled(result.summary_path.exists())
+        self.open_outputs.setEnabled(True)
+        self.close_button.setEnabled(True)
+        if result.summary_path.exists():
+            self._review_result()
+
+    def _fail(self, details: str) -> None:
+        self._finished = True
+        self._timer.stop()
+        self._append_log(details)
+        self._flush_log()
+        self.status_label.setText("ADR optimization failed.")
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.open_outputs.setEnabled(True)
+        self.close_button.setEnabled(True)
+        showWarning(details, title=ADDON_TITLE)
+
+    def _review_result(self) -> None:
+        if self._result is None or self._saved:
+            return
+        saved = _review_batch_optimizer_result(self._request, self._result)
+        if saved:
+            self._saved = True
+            self.review_car.setEnabled(False)
+            self.status_label.setText("ADR optimization complete; car saved.")
 
 
 class SimulationDialog(QDialog):
@@ -1863,7 +2017,10 @@ def run_optimizer_subprocess(
     )
 
 
-def run_batch_optimizer_subprocess(request: BatchOptimizeRequest) -> BatchOptimizeResult:
+def run_batch_optimizer_subprocess(
+    request: BatchOptimizeRequest,
+    out_queue: queue.Queue[tuple[str, Any]] | None = None,
+) -> BatchOptimizeResult:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     binary = resolve_binary()
     batch_config = _batch_config_for_request(request)
@@ -1873,6 +2030,7 @@ def run_batch_optimizer_subprocess(request: BatchOptimizeRequest) -> BatchOptimi
     )
 
     cmd = [str(binary), "--batch-config", str(request.batch_config_path)]
+    _queue_log(out_queue, "Command:\n" + _format_command(cmd) + "\n\n")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen(
         cmd,
@@ -1888,6 +2046,7 @@ def run_batch_optimizer_subprocess(request: BatchOptimizeRequest) -> BatchOptimi
     assert proc.stdout is not None
     for line in proc.stdout:
         output_parts.append(line)
+        _queue_log(out_queue, line)
     returncode = int(proc.wait())
     output = "".join(output_parts)
     summary_path = _batch_summary_path_from_output(output) or request.batch_output_path
@@ -2520,6 +2679,44 @@ def _simulate_with_export() -> None:
     run_dialog.activateWindow()
 
 
+def _review_batch_optimizer_result(
+    request: BatchOptimizeRequest,
+    result: BatchOptimizeResult,
+) -> bool:
+    if result.returncode != 0 and not result.summary_path.exists():
+        showWarning(
+            "Batch optimizer failed.\n\n" + _tail_text(result.output),
+            title=ADDON_TITLE,
+        )
+        return False
+    if not result.summary_path.exists():
+        showWarning(
+            "Batch optimizer finished but no batch summary was found.\n\n"
+            + _tail_text(result.output),
+            title=ADDON_TITLE,
+        )
+        return False
+    try:
+        summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        showWarning(f"Could not read batch summary:\n{exc}", title=ADDON_TITLE)
+        return False
+
+    review = CarReviewDialog(request, summary)
+    if _exec_dialog(review) != 1:
+        return False
+    try:
+        car = _make_car(review.policies, request.export_path)
+        _save_new_car(car)
+    except Exception as exc:
+        showWarning(f"Could not save car:\n{exc}", title=ADDON_TITLE)
+        return False
+    _show_info(
+        f"Saved car {_short_car_id(car)} with {len(review.policies)} preset policy snapshots."
+    )
+    return True
+
+
 def _optimize_adr_parameters() -> None:
     export_path = _pick_export_file()
     if export_path is None:
@@ -2541,51 +2738,17 @@ def _optimize_adr_parameters() -> None:
         return
     request = dialog.request
 
-    def task() -> BatchOptimizeResult:
-        return run_batch_optimizer_subprocess(request)
+    run_dialog = BatchRunProgressDialog(request)
+    mw._linear_adr_batch_run_dialog = run_dialog
 
-    def done(future: Any) -> None:
-        try:
-            result = future.result()
-        except Exception as exc:
-            showWarning(str(exc), title=ADDON_TITLE)
-            return
-        if result.returncode != 0 and not result.summary_path.exists():
-            showWarning(
-                "Batch optimizer failed.\n\n" + _tail_text(result.output),
-                title=ADDON_TITLE,
-            )
-            return
-        if not result.summary_path.exists():
-            showWarning(
-                "Batch optimizer finished but no batch summary was found.\n\n"
-                + _tail_text(result.output),
-                title=ADDON_TITLE,
-            )
-            return
-        try:
-            summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            showWarning(f"Could not read batch summary:\n{exc}", title=ADDON_TITLE)
-            return
+    def forget_run_dialog(*_args: Any) -> None:
+        if getattr(mw, "_linear_adr_batch_run_dialog", None) is run_dialog:
+            mw._linear_adr_batch_run_dialog = None
 
-        review = CarReviewDialog(request, summary)
-        if _exec_dialog(review) != 1:
-            return
-        car = _make_car(review.policies, export_path)
-        _save_new_car(car)
-        _show_info(
-            f"Saved car {_short_car_id(car)} with {len(review.policies)} preset policy snapshots."
-        )
-
-    mw.taskman.with_progress(
-        task,
-        done,
-        parent=mw,
-        label="Optimizing ADR parameters...",
-        immediate=True,
-        title=ADDON_TITLE,
-    )
+    qconnect(run_dialog.finished, forget_run_dialog)
+    run_dialog.show()
+    run_dialog.raise_()
+    run_dialog.activateWindow()
 
 
 def _manage_cars() -> None:
