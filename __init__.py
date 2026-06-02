@@ -2224,11 +2224,18 @@ def _policy_for_card(
         policy = _policy_for_preset(car, preset_id, preset_name)
         if policy is None:
             continue
-        matches.append((str(car.get("created_at", "")), car, policy))
+        matches.append(
+            (
+                position_day,
+                str(car.get("created_at", "")),
+                str(car.get("id", "")),
+                policy,
+            )
+        )
     if not matches:
         return None
-    matches.sort(key=lambda item: item[0], reverse=True)
-    return matches[0][2]
+    matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return matches[0][3]
 
 
 def _policy_for_preset(
