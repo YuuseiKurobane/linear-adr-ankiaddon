@@ -95,6 +95,12 @@ POLICY_MODE_NORMAL_ANKI = "normal_anki"
 CARD_CUSTOM_DATA_RESCHEDULE_KEY = "v"
 CARD_CUSTOM_DATA_RESCHEDULE_VALUE = "reschedule"
 DEFAULT_TIMELINE_SUBDIVISIONS = 5
+DEFAULT_SCRIPT_FUZZ_FACTOR = 1.8
+DEFAULT_SCRIPT_MAX_INTERVAL = 36500
+DEFAULT_SCRIPT_SOFT_CAP_THRESHOLD = 3650.0
+DEFAULT_SCRIPT_SOFT_CAP_POWER = 0.5
+DEFAULT_SCRIPT_W20 = 0.5
+CUSTOM_SCHEDULING_KEY = "custom_scheduling"
 
 POLICY_MODE_LABELS = {
     POLICY_MODE_ADR: "ADR",
@@ -535,6 +541,14 @@ class BatchOptimizeResult:
     summary_path: Path
     returncode: int
     output: str
+
+
+@dataclass
+class CustomSchedulingScriptResult:
+    output_path: Path
+    included_policy_count: int
+    skipped_policy_count: int
+    rule_count: int
 
 
 class _QueueWriter(io.TextIOBase):
@@ -1461,6 +1475,225 @@ class BatchOptimizeDialog(QDialog):
         return jobs
 
 
+def _set_widget_tree_enabled(widget: QWidget, enabled: bool) -> None:
+    widget.setEnabled(enabled)
+    for child in widget.findChildren(QWidget):
+        child.setEnabled(enabled)
+
+
+def _checkbox_cell(
+    parent: QWidget,
+    *,
+    checked: bool,
+    enabled: bool = True,
+    tooltip: str = "",
+) -> QWidget:
+    checkbox = QCheckBox(parent)
+    checkbox.setChecked(checked)
+    checkbox.setEnabled(enabled)
+    if tooltip:
+        checkbox.setToolTip(tooltip)
+    box = QWidget(parent)
+    layout = QHBoxLayout(box)
+    layout.setContentsMargins(8, 0, 8, 0)
+    layout.addWidget(checkbox)
+    layout.addStretch(1)
+    box._linear_adr_checkbox = checkbox
+    return box
+
+
+def _cell_checkbox(table: QTableWidget, row_index: int, col_index: int) -> QCheckBox | None:
+    box = table.cellWidget(row_index, col_index)
+    checkbox = getattr(box, "_linear_adr_checkbox", None)
+    return checkbox if isinstance(checkbox, QCheckBox) else None
+
+
+def _adr_params_cell(
+    parent: QWidget,
+    *,
+    flat: float,
+    s_multi: float,
+    d_multi: float,
+    enabled: bool = True,
+) -> QWidget:
+    box = QWidget(parent)
+    layout = QHBoxLayout(box)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+    spins = []
+    for value, tooltip in (
+        (flat, "ADR_FLAT"),
+        (s_multi, "ADR_S_MULTI"),
+        (d_multi, "ADR_D_MULTI"),
+    ):
+        spin = NoWheelDoubleSpinBox(box)
+        spin.setRange(-1_000_000.0, 1_000_000.0)
+        spin.setDecimals(6)
+        spin.setSingleStep(0.01)
+        spin.setKeyboardTracking(False)
+        spin.setValue(float(value))
+        spin.setToolTip(tooltip)
+        spin.setMinimumWidth(112)
+        layout.addWidget(spin)
+        spins.append(spin)
+    box._linear_adr_flat = spins[0]
+    box._linear_adr_s_multi = spins[1]
+    box._linear_adr_d_multi = spins[2]
+    _set_widget_tree_enabled(box, enabled)
+    return box
+
+
+def _read_adr_params_cell(widget: QWidget | None) -> dict[str, float]:
+    flat = getattr(widget, "_linear_adr_flat", None)
+    s_multi = getattr(widget, "_linear_adr_s_multi", None)
+    d_multi = getattr(widget, "_linear_adr_d_multi", None)
+    if not all(isinstance(spin, QDoubleSpinBox) for spin in (flat, s_multi, d_multi)):
+        raise ValueError("ADR parameter widgets missing.")
+    return {
+        "flat": float(flat.value()),  # type: ignore[union-attr]
+        "s_multi": float(s_multi.value()),  # type: ignore[union-attr]
+        "d_multi": float(d_multi.value()),  # type: ignore[union-attr]
+    }
+
+
+def _script_settings_summary(settings: dict[str, Any]) -> str:
+    cap = "off"
+    if bool(settings.get("soft_cap_enabled", True)):
+        cap = f"{float(settings.get('soft_cap_threshold', DEFAULT_SCRIPT_SOFT_CAP_THRESHOLD)):.0f}/{float(settings.get('soft_cap_power', DEFAULT_SCRIPT_SOFT_CAP_POWER)):.2f}"
+    return (
+        f"W20 {float(settings.get('w20', DEFAULT_SCRIPT_W20)):.4f}, "
+        f"max {int(settings.get('max_interval', DEFAULT_SCRIPT_MAX_INTERVAL))}, "
+        f"fuzz {float(settings.get('fuzz_factor', DEFAULT_SCRIPT_FUZZ_FACTOR)):.2f}, "
+        f"cap {cap}"
+    )
+
+
+class ScriptSettingsDialog(QDialog):
+    def __init__(self, settings: dict[str, Any], parent: QWidget) -> None:
+        super().__init__(parent)
+        self.settings = dict(settings)
+        self.setWindowTitle(f"{ADDON_TITLE} - Custom scheduling settings")
+        self.resize(520, 320)
+
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Generated scripts use the cleaned experiment order: raw ADR interval, "
+            "soft power cap, max interval, fuzz, final clamp. The soft cap defaults "
+            "to threshold 3650 days and power 0.5.",
+            self,
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        self.w20 = NoWheelDoubleSpinBox(self)
+        self.w20.setRange(0.000001, 10.0)
+        self.w20.setDecimals(6)
+        self.w20.setSingleStep(0.01)
+        self.w20.setKeyboardTracking(False)
+        self.w20.setValue(float(settings.get("w20", DEFAULT_SCRIPT_W20)))
+        form.addRow("W20", self.w20)
+
+        self.max_interval = NoWheelSpinBox(self)
+        self.max_interval.setRange(1, 1_000_000)
+        self.max_interval.setValue(int(settings.get("max_interval", DEFAULT_SCRIPT_MAX_INTERVAL)))
+        form.addRow("Max interval", self.max_interval)
+
+        self.fuzz_factor = NoWheelDoubleSpinBox(self)
+        self.fuzz_factor.setRange(-1.0, 100.0)
+        self.fuzz_factor.setDecimals(3)
+        self.fuzz_factor.setSingleStep(0.1)
+        self.fuzz_factor.setKeyboardTracking(False)
+        self.fuzz_factor.setValue(float(settings.get("fuzz_factor", DEFAULT_SCRIPT_FUZZ_FACTOR)))
+        self.fuzz_factor.setToolTip("Use a negative value to disable fuzz.")
+        form.addRow("Fuzz factor", self.fuzz_factor)
+
+        self.soft_cap_enabled = QCheckBox("Use soft power cap", self)
+        self.soft_cap_enabled.setChecked(bool(settings.get("soft_cap_enabled", True)))
+        form.addRow("Soft cap", self.soft_cap_enabled)
+
+        self.soft_cap_threshold = NoWheelDoubleSpinBox(self)
+        self.soft_cap_threshold.setRange(1.0, 1_000_000.0)
+        self.soft_cap_threshold.setDecimals(1)
+        self.soft_cap_threshold.setSingleStep(100.0)
+        self.soft_cap_threshold.setKeyboardTracking(False)
+        self.soft_cap_threshold.setValue(
+            float(settings.get("soft_cap_threshold", DEFAULT_SCRIPT_SOFT_CAP_THRESHOLD))
+        )
+        form.addRow("Soft cap threshold", self.soft_cap_threshold)
+
+        self.soft_cap_power = NoWheelDoubleSpinBox(self)
+        self.soft_cap_power.setRange(0.01, 0.99)
+        self.soft_cap_power.setDecimals(2)
+        self.soft_cap_power.setSingleStep(0.05)
+        self.soft_cap_power.setKeyboardTracking(False)
+        self.soft_cap_power.setValue(
+            float(settings.get("soft_cap_power", DEFAULT_SCRIPT_SOFT_CAP_POWER))
+        )
+        form.addRow("Soft cap power", self.soft_cap_power)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel", self)
+        ok = QPushButton("OK", self)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        layout.addLayout(buttons)
+
+        qconnect(cancel.clicked, self.reject)
+        qconnect(ok.clicked, self._accept)
+
+    def _accept(self) -> None:
+        self.settings = {
+            "w20": float(self.w20.value()),
+            "max_interval": int(self.max_interval.value()),
+            "fuzz_factor": float(self.fuzz_factor.value()),
+            "soft_cap_enabled": self.soft_cap_enabled.isChecked(),
+            "soft_cap_threshold": float(self.soft_cap_threshold.value()),
+            "soft_cap_power": float(self.soft_cap_power.value()),
+        }
+        self.accept()
+
+
+def _script_settings_cell(
+    parent: QWidget,
+    settings: dict[str, Any],
+    *,
+    enabled: bool = True,
+) -> QWidget:
+    box = QWidget(parent)
+    layout = QHBoxLayout(box)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    summary = QLabel(_script_settings_summary(settings), box)
+    summary.setMinimumWidth(280)
+    summary.setWordWrap(False)
+    edit = QPushButton("Edit...", box)
+    box._linear_adr_script_settings = dict(settings)
+    box._linear_adr_script_summary = summary
+
+    def edit_settings() -> None:
+        dialog = ScriptSettingsDialog(box._linear_adr_script_settings, box)
+        if _exec_dialog(dialog) != 1:
+            return
+        box._linear_adr_script_settings = dict(dialog.settings)
+        summary.setText(_script_settings_summary(box._linear_adr_script_settings))
+
+    qconnect(edit.clicked, edit_settings)
+    layout.addWidget(summary, 1)
+    layout.addWidget(edit)
+    _set_widget_tree_enabled(box, enabled)
+    return box
+
+
+def _read_script_settings_cell(widget: QWidget | None) -> dict[str, Any]:
+    settings = getattr(widget, "_linear_adr_script_settings", None)
+    if not isinstance(settings, dict):
+        raise ValueError("Custom scheduling settings widget missing.")
+    return dict(settings)
+
+
 class CarReviewDialog(QDialog):
     def __init__(
         self,
@@ -1471,9 +1704,10 @@ class CarReviewDialog(QDialog):
         self.request = request
         self.summary = summary
         self.policies: list[dict[str, Any]] = []
+        self.generate_script = False
 
         self.setWindowTitle(f"{ADDON_TITLE} - Save Car")
-        self.resize(980, 560)
+        self.resize(1180, 620)
 
         layout = QVBoxLayout(self)
         label = QLabel(
@@ -1484,16 +1718,15 @@ class CarReviewDialog(QDialog):
         label.setWordWrap(True)
         layout.addWidget(label)
 
-        self.table = QTableWidget(len(request.jobs), 7, self)
+        self.table = QTableWidget(len(request.jobs), 6, self)
         self.table.setHorizontalHeaderLabels(
             [
+                "Include in car",
                 "Deck preset",
                 "Mode",
-                "ADR_FLAT",
-                "ADR_S_MULTI",
-                "ADR_D_MULTI",
+                "ADR params (flat / S / D)",
                 "Fixed DR %",
-                "Action",
+                "Custom scheduling",
             ]
         )
         self.table.verticalHeader().setVisible(False)
@@ -1507,10 +1740,23 @@ class CarReviewDialog(QDialog):
         for row_index, job in enumerate(request.jobs):
             result = results.get(str(job["id"]), {})
             point = _selected_point_from_result(result, str(job.get("selection", "recommended")))
+            row = job.get("_row", {})
+            preset = row.get("deck_preset", {}) if isinstance(row, dict) else {}
+            temp_policy = {
+                "preset_id": _optional_int(preset.get("id")),
+                "preset_name": str(preset.get("name") or job.get("preset") or ""),
+                "deck_ids": [
+                    int(deck.get("id"))
+                    for deck in row.get("decks", [])
+                    if isinstance(deck, dict) and deck.get("id") is not None
+                ],
+            }
+
+            self.table.setCellWidget(row_index, 0, _checkbox_cell(self.table, checked=True))
 
             preset_item = QTableWidgetItem(str(job["preset"]))
             preset_item.setFlags(_readonly_item_flags(preset_item))
-            self.table.setItem(row_index, 0, preset_item)
+            self.table.setItem(row_index, 1, preset_item)
 
             mode_combo = QComboBox(self.table)
             for mode in (
@@ -1521,23 +1767,16 @@ class CarReviewDialog(QDialog):
                 mode_combo.addItem(POLICY_MODE_LABELS[mode], mode)
             if point is None:
                 mode_combo.setCurrentIndex(1)
-            self.table.setCellWidget(row_index, 1, mode_combo)
+            self.table.setCellWidget(row_index, 2, mode_combo)
 
-            flat = NoWheelDoubleSpinBox(self.table)
-            s_multi = NoWheelDoubleSpinBox(self.table)
-            d_multi = NoWheelDoubleSpinBox(self.table)
-            for spin in (flat, s_multi, d_multi):
-                spin.setRange(-1_000_000.0, 1_000_000.0)
-                spin.setDecimals(6)
-                spin.setSingleStep(0.01)
-                spin.setKeyboardTracking(False)
-            if point is not None:
-                flat.setValue(float(point["flat"]))
-                s_multi.setValue(float(point["s_multi"]))
-                d_multi.setValue(float(point["d_multi"]))
-            self.table.setCellWidget(row_index, 2, flat)
-            self.table.setCellWidget(row_index, 3, s_multi)
-            self.table.setCellWidget(row_index, 4, d_multi)
+            adr_cell = _adr_params_cell(
+                self.table,
+                flat=float(point["flat"]) if point is not None else 0.0,
+                s_multi=float(point["s_multi"]) if point is not None else 0.0,
+                d_multi=float(point["d_multi"]) if point is not None else 0.0,
+                enabled=point is not None,
+            )
+            self.table.setCellWidget(row_index, 3, adr_cell)
 
             fixed = NoWheelDoubleSpinBox(self.table)
             fixed.setRange(1.0, 99.5)
@@ -1545,18 +1784,27 @@ class CarReviewDialog(QDialog):
             fixed.setSingleStep(1.0)
             fixed.setKeyboardTracking(False)
             fixed.setValue(float(job.get("target_dr", 90.0)))
-            self.table.setCellWidget(row_index, 5, fixed)
+            self.table.setCellWidget(row_index, 4, fixed)
 
-            action = QComboBox(self.table)
-            action.addItem("Keep", "keep")
-            action.addItem("Remove", "remove")
-            self.table.setCellWidget(row_index, 6, action)
+            settings = _default_script_settings_for_policy(temp_policy)
+            self.table.setCellWidget(row_index, 5, _script_settings_cell(self.table, settings, enabled=point is not None))
 
-            self.table.item(row_index, 0).setData(_qt_user_role(), job)
+            self.table.item(row_index, 1).setData(_qt_user_role(), job)
+
+            qconnect(
+                mode_combo.currentIndexChanged,
+                lambda _index, row=row_index: self._refresh_row(row),
+            )
+            checkbox = _cell_checkbox(self.table, row_index, 0)
+            if checkbox is not None:
+                qconnect(checkbox.stateChanged, lambda _state, row=row_index: self._refresh_row(row))
+            self._refresh_row(row_index)
 
         self.table.resizeColumnsToContents()
 
         buttons = QHBoxLayout()
+        save_generate = QPushButton("Save and Generate custom scheduling script", self)
+        buttons.addWidget(save_generate)
         buttons.addStretch(1)
         cancel = QPushButton("Cancel", self)
         save = QPushButton("Save car", self)
@@ -1565,9 +1813,28 @@ class CarReviewDialog(QDialog):
         layout.addLayout(buttons)
 
         qconnect(cancel.clicked, self.reject)
-        qconnect(save.clicked, self._accept)
+        qconnect(save.clicked, lambda: self._accept(generate_script=False))
+        qconnect(save_generate.clicked, lambda: self._accept(generate_script=True))
 
-    def _accept(self) -> None:
+    def _refresh_row(self, row_index: int) -> None:
+        include = _cell_checkbox(self.table, row_index, 0)
+        included = include.isChecked() if include is not None else True
+        mode_combo = self.table.cellWidget(row_index, 2)
+        mode = str(mode_combo.currentData() if isinstance(mode_combo, QComboBox) else POLICY_MODE_ADR)
+        adr_enabled = included and mode == POLICY_MODE_ADR
+        fixed_enabled = included and mode == POLICY_MODE_FIXED_DR
+        adr_cell = self.table.cellWidget(row_index, 3)
+        fixed = self.table.cellWidget(row_index, 4)
+        script = self.table.cellWidget(row_index, 5)
+        if isinstance(adr_cell, QWidget):
+            _set_widget_tree_enabled(adr_cell, adr_enabled)
+        if isinstance(fixed, QWidget):
+            fixed.setEnabled(fixed_enabled)
+        if isinstance(script, QWidget):
+            _set_widget_tree_enabled(script, adr_enabled)
+
+    def _accept(self, *, generate_script: bool) -> None:
+        self.generate_script = generate_script
         try:
             self.policies = self._read_policies()
         except Exception as exc:
@@ -1576,26 +1843,29 @@ class CarReviewDialog(QDialog):
         if not self.policies:
             showWarning("No policies to save.", title=ADDON_TITLE)
             return
+        if generate_script and not any(_policy_is_script_eligible(policy) for policy in self.policies):
+            showWarning("Select at least one ADR policy to include in the custom scheduling script.", title=ADDON_TITLE)
+            return
         self.accept()
 
     def _read_policies(self) -> list[dict[str, Any]]:
         policies = []
         for row_index in range(self.table.rowCount()):
-            item = self.table.item(row_index, 0)
+            include = _cell_checkbox(self.table, row_index, 0)
+            if include is not None and not include.isChecked():
+                continue
+            item = self.table.item(row_index, 1)
             job = item.data(_qt_user_role()) if item is not None else None
             if not isinstance(job, dict):
                 continue
             row = job.get("_row", {})
             preset = row.get("deck_preset", {}) if isinstance(row, dict) else {}
-            mode_combo = self.table.cellWidget(row_index, 1)
-            fixed_widget = self.table.cellWidget(row_index, 5)
+            mode_combo = self.table.cellWidget(row_index, 2)
+            fixed_widget = self.table.cellWidget(row_index, 4)
             if not isinstance(mode_combo, QComboBox):
                 raise ValueError("Mode widget missing.")
             if not isinstance(fixed_widget, QDoubleSpinBox):
                 raise ValueError("Fixed DR widget missing.")
-            action_combo = self.table.cellWidget(row_index, 6)
-            if isinstance(action_combo, QComboBox) and action_combo.currentData() == "remove":
-                continue
             mode = str(mode_combo.currentData() or POLICY_MODE_ADR)
             policy: dict[str, Any] = {
                 "preset_id": _optional_int(preset.get("id")),
@@ -1620,16 +1890,10 @@ class CarReviewDialog(QDialog):
                 },
             }
             if mode == POLICY_MODE_ADR:
-                flat = self.table.cellWidget(row_index, 2)
-                s_multi = self.table.cellWidget(row_index, 3)
-                d_multi = self.table.cellWidget(row_index, 4)
-                if not all(isinstance(widget, QDoubleSpinBox) for widget in (flat, s_multi, d_multi)):
-                    raise ValueError("ADR parameter widgets missing.")
-                policy["adr"] = {
-                    "flat": float(flat.value()),  # type: ignore[union-attr]
-                    "s_multi": float(s_multi.value()),  # type: ignore[union-attr]
-                    "d_multi": float(d_multi.value()),  # type: ignore[union-attr]
-                }
+                policy["adr"] = _read_adr_params_cell(self.table.cellWidget(row_index, 3))
+                policy[CUSTOM_SCHEDULING_KEY] = _read_script_settings_cell(
+                    self.table.cellWidget(row_index, 5)
+                )
             policies.append(policy)
         return policies
 
@@ -2094,6 +2358,170 @@ class PolicyEditDialog(QDialog):
         return policies
 
 
+class CustomSchedulingScriptDialog(QDialog):
+    def __init__(self) -> None:
+        super().__init__(mw)
+        self.cars = _active_cars()
+        self.result: CustomSchedulingScriptResult | None = None
+        self.setWindowTitle(f"{ADDON_TITLE} - Generate custom scheduling script")
+        self.resize(1180, 620)
+
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Choose a car and include the ADR preset policies that should be written into the generated script. "
+            "Fixed DR and Normal Anki policies are shown as Not included.",
+            self,
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        self.car_combo = QComboBox(self)
+        for index, car in enumerate(self.cars):
+            self.car_combo.addItem(
+                f"{_short_car_id(car)} at {_car_position_label(car)} - {_policy_summary(car)}",
+                index,
+            )
+        form.addRow("Car", self.car_combo)
+        layout.addLayout(form)
+
+        self.table = QTableWidget(0, 5, self)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Include in script",
+                "Deck preset",
+                "ADR params (flat / S / D)",
+                "Custom scheduling",
+                "Status",
+            ]
+        )
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel", self)
+        generate = QPushButton("Generate custom scheduling script", self)
+        buttons.addWidget(cancel)
+        buttons.addWidget(generate)
+        layout.addLayout(buttons)
+
+        qconnect(self.car_combo.currentIndexChanged, lambda _index: self._refresh_table())
+        qconnect(cancel.clicked, self.reject)
+        qconnect(generate.clicked, self._accept)
+        self._refresh_table()
+
+    def _selected_car(self) -> dict[str, Any] | None:
+        index = self.car_combo.currentData()
+        if index is None:
+            index = self.car_combo.currentIndex()
+        try:
+            return self.cars[int(index)]
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _refresh_table(self) -> None:
+        car = self._selected_car()
+        policies = [p for p in (car or {}).get("policies", []) if isinstance(p, dict)]
+        self.table.setRowCount(len(policies))
+        for row_index, policy in enumerate(policies):
+            eligible = _policy_is_script_eligible(policy)
+            include_cell = _checkbox_cell(
+                self.table,
+                checked=eligible,
+                enabled=eligible,
+                tooltip="" if eligible else "Only ADR policies can be included in a custom scheduling script.",
+            )
+            self.table.setCellWidget(row_index, 0, include_cell)
+
+            preset_item = QTableWidgetItem(str(policy.get("preset_name") or policy.get("preset_id") or "Preset"))
+            preset_item.setFlags(_readonly_item_flags(preset_item))
+            preset_item.setData(_qt_user_role(), policy)
+            self.table.setItem(row_index, 1, preset_item)
+
+            adr = policy.get("adr") if isinstance(policy.get("adr"), dict) else {}
+            self.table.setCellWidget(
+                row_index,
+                2,
+                _adr_params_cell(
+                    self.table,
+                    flat=float(adr.get("flat", 0.0) or 0.0),
+                    s_multi=float(adr.get("s_multi", 0.0) or 0.0),
+                    d_multi=float(adr.get("d_multi", 0.0) or 0.0),
+                    enabled=eligible,
+                ),
+            )
+            self.table.setCellWidget(
+                row_index,
+                3,
+                _script_settings_cell(
+                    self.table,
+                    _default_script_settings_for_policy(policy),
+                    enabled=eligible,
+                ),
+            )
+            status_item = QTableWidgetItem("")
+            status_item.setFlags(_readonly_item_flags(status_item))
+            self.table.setItem(row_index, 4, status_item)
+
+            checkbox = _cell_checkbox(self.table, row_index, 0)
+            if checkbox is not None:
+                qconnect(checkbox.stateChanged, lambda _state, row=row_index: self._refresh_status(row))
+            self._refresh_status(row_index)
+        self.table.resizeColumnsToContents()
+
+    def _refresh_status(self, row_index: int) -> None:
+        checkbox = _cell_checkbox(self.table, row_index, 0)
+        item = self.table.item(row_index, 4)
+        if item is None:
+            return
+        included = checkbox.isChecked() if checkbox is not None and checkbox.isEnabled() else False
+        item.setText("Included" if included else "Not included")
+        for col_index in (2, 3):
+            widget = self.table.cellWidget(row_index, col_index)
+            if isinstance(widget, QWidget):
+                _set_widget_tree_enabled(widget, included)
+
+    def _selected_policies(self) -> list[dict[str, Any]]:
+        selected = []
+        for row_index in range(self.table.rowCount()):
+            checkbox = _cell_checkbox(self.table, row_index, 0)
+            if checkbox is None or not checkbox.isChecked() or not checkbox.isEnabled():
+                continue
+            item = self.table.item(row_index, 1)
+            original = item.data(_qt_user_role()) if item is not None else None
+            if not isinstance(original, dict):
+                continue
+            policy = dict(original)
+            if not _policy_is_script_eligible(policy):
+                continue
+            policy["adr"] = _read_adr_params_cell(self.table.cellWidget(row_index, 2))
+            policy[CUSTOM_SCHEDULING_KEY] = _read_script_settings_cell(
+                self.table.cellWidget(row_index, 3)
+            )
+            selected.append(policy)
+        return selected
+
+    def _accept(self) -> None:
+        car = self._selected_car()
+        if car is None:
+            showWarning("Select a car first.", title=ADDON_TITLE)
+            return
+        policies = self._selected_policies()
+        if not policies:
+            showWarning("Select at least one ADR policy to include in the script.", title=ADDON_TITLE)
+            return
+        try:
+            self.result = _write_custom_scheduling_script(
+                policies,
+                source_label=f"car {_short_car_id(car)}",
+            )
+        except Exception as exc:
+            showWarning(str(exc), title=ADDON_TITLE)
+            return
+        self.accept()
+
+
 class SchedulingOperationDialog(QDialog):
     def __init__(self, operation: str, deck_id: int | None) -> None:
         super().__init__(mw)
@@ -2439,6 +2867,456 @@ def _selected_point_from_result(
         }
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _first_policy_deck_config(policy: dict[str, Any]) -> dict[str, Any] | None:
+    if mw is None or mw.col is None:
+        return None
+    for deck_id in policy.get("deck_ids", []):
+        try:
+            return mw.col.decks.config_dict_for_deck_id(int(deck_id))
+        except Exception:
+            continue
+    preset_id = _optional_int(policy.get("preset_id"))
+    if preset_id is not None:
+        try:
+            config = mw.col.decks.get_config(preset_id)
+        except Exception:
+            config = None
+        if isinstance(config, dict):
+            return config
+    return None
+
+
+def _fsrs_w20_from_config(config: dict[str, Any] | None) -> float:
+    if not isinstance(config, dict):
+        return DEFAULT_SCRIPT_W20
+    for key in ("fsrsParams6", "fsrs_params_6"):
+        values = config.get(key)
+        if not values:
+            continue
+        try:
+            params = [float(value) for value in values]
+        except (TypeError, ValueError):
+            continue
+        if len(params) > 20 and params[20] > 0:
+            return params[20]
+    return DEFAULT_SCRIPT_W20
+
+
+def _max_interval_from_config(config: dict[str, Any] | None) -> int:
+    if not isinstance(config, dict):
+        return DEFAULT_SCRIPT_MAX_INTERVAL
+    candidates = [
+        config.get("maximumReviewInterval"),
+        config.get("maximum_review_interval"),
+    ]
+    rev = config.get("rev")
+    if isinstance(rev, dict):
+        candidates.extend([rev.get("maxIvl"), rev.get("max_ivl")])
+    for value in candidates:
+        try:
+            interval = int(value)
+        except (TypeError, ValueError):
+            continue
+        if interval > 0:
+            return interval
+    return DEFAULT_SCRIPT_MAX_INTERVAL
+
+
+def _default_script_settings_for_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    addon_config = _addon_config()
+    deck_config = _first_policy_deck_config(policy)
+    settings = {
+        "w20": _fsrs_w20_from_config(deck_config),
+        "max_interval": _max_interval_from_config(deck_config),
+        "fuzz_factor": DEFAULT_SCRIPT_FUZZ_FACTOR,
+        "soft_cap_enabled": bool(addon_config.get("enable_soft_interval_cap", True)),
+        "soft_cap_threshold": float(
+            addon_config.get("soft_interval_cap_threshold", DEFAULT_SCRIPT_SOFT_CAP_THRESHOLD)
+            or DEFAULT_SCRIPT_SOFT_CAP_THRESHOLD
+        ),
+        "soft_cap_power": float(
+            addon_config.get("soft_interval_cap_power", DEFAULT_SCRIPT_SOFT_CAP_POWER)
+            or DEFAULT_SCRIPT_SOFT_CAP_POWER
+        ),
+    }
+    saved = policy.get(CUSTOM_SCHEDULING_KEY)
+    if isinstance(saved, dict):
+        for key in (
+            "w20",
+            "max_interval",
+            "fuzz_factor",
+            "soft_cap_enabled",
+            "soft_cap_threshold",
+            "soft_cap_power",
+        ):
+            if key in saved:
+                settings[key] = saved[key]
+    return _normalize_script_settings(settings)
+
+
+def _normalize_script_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    def number(key: str, default: float) -> float:
+        try:
+            value = float(settings.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return value
+
+    max_interval = int(max(1, round(number("max_interval", DEFAULT_SCRIPT_MAX_INTERVAL))))
+    soft_power = max(0.01, min(0.99, number("soft_cap_power", DEFAULT_SCRIPT_SOFT_CAP_POWER)))
+    return {
+        "w20": max(0.000001, number("w20", DEFAULT_SCRIPT_W20)),
+        "max_interval": max_interval,
+        "fuzz_factor": number("fuzz_factor", DEFAULT_SCRIPT_FUZZ_FACTOR),
+        "soft_cap_enabled": bool(settings.get("soft_cap_enabled", True)),
+        "soft_cap_threshold": max(
+            1.0,
+            number("soft_cap_threshold", DEFAULT_SCRIPT_SOFT_CAP_THRESHOLD),
+        ),
+        "soft_cap_power": soft_power,
+    }
+
+
+def _policy_is_script_eligible(policy: dict[str, Any]) -> bool:
+    return (
+        str(policy.get("mode", POLICY_MODE_ADR)) == POLICY_MODE_ADR
+        and isinstance(policy.get("adr"), dict)
+    )
+
+
+def _normal_deck_rows_with_configs() -> list[dict[str, Any]]:
+    if mw is None or mw.col is None:
+        raise ValueError("No collection is open.")
+    rows = []
+    for deck in mw.col.decks.all():
+        if not isinstance(deck, dict) or deck.get("dyn"):
+            continue
+        deck_id = _optional_int(deck.get("id"))
+        name = str(deck.get("name") or "")
+        if deck_id is None or not name:
+            continue
+        try:
+            config = mw.col.decks.config_dict_for_deck_id(deck_id)
+        except Exception:
+            config = None
+        if not isinstance(config, dict):
+            continue
+        rows.append(
+            {
+                "deck_id": deck_id,
+                "deck_name": name,
+                "config_id": _optional_int(config.get("id", deck.get("conf"))),
+                "config_name": str(config.get("name") or ""),
+            }
+        )
+    rows.sort(key=lambda row: str(row["deck_name"]).casefold())
+    return rows
+
+
+def _script_policy_indexes(policies: list[dict[str, Any]]) -> tuple[dict[int, int], dict[str, int]]:
+    by_id: dict[int, int] = {}
+    by_name: dict[str, int] = {}
+    for index, policy in enumerate(policies):
+        preset_id = _optional_int(policy.get("preset_id"))
+        preset_name = str(policy.get("preset_name", "")).casefold()
+        if preset_id is not None and preset_id not in by_id:
+            by_id[preset_id] = index
+        if preset_name and preset_name not in by_name:
+            by_name[preset_name] = index
+    return by_id, by_name
+
+
+def _policy_index_for_deck_row(
+    deck_row: dict[str, Any],
+    by_id: dict[int, int],
+    by_name: dict[str, int],
+) -> int | None:
+    config_id = _optional_int(deck_row.get("config_id"))
+    if config_id is not None and config_id in by_id:
+        return by_id[config_id]
+    config_name = str(deck_row.get("config_name") or "").casefold()
+    return by_name.get(config_name)
+
+
+def _build_custom_script_rules(policies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id, by_name = _script_policy_indexes(policies)
+    root: dict[str, Any] = {"full": "", "policy_index": None, "children": {}}
+    for deck_row in _normal_deck_rows_with_configs():
+        policy_index = _policy_index_for_deck_row(deck_row, by_id, by_name)
+        parts = [part for part in str(deck_row["deck_name"]).split("::") if part]
+        node = root
+        full_parts: list[str] = []
+        for part in parts:
+            full_parts.append(part)
+            children = node.setdefault("children", {})
+            if part not in children:
+                children[part] = {
+                    "full": "::".join(full_parts),
+                    "policy_index": None,
+                    "children": {},
+                }
+            node = children[part]
+        node["policy_index"] = policy_index
+
+    mixed = object()
+
+    def uniform_policy(node: dict[str, Any]) -> Any:
+        values = []
+        if node.get("full"):
+            values.append(node.get("policy_index"))
+        for child in node.get("children", {}).values():
+            child_value = uniform_policy(child)
+            if child_value is mixed:
+                return mixed
+            values.append(child_value)
+        if not values:
+            return None
+        first = values[0]
+        if all(value == first for value in values):
+            return first
+        return mixed
+
+    rules: list[dict[str, Any]] = []
+
+    def walk(node: dict[str, Any]) -> None:
+        uniform = uniform_policy(node)
+        full = str(node.get("full") or "")
+        if full and isinstance(uniform, int):
+            rules.append({"p": full, "e": 0, "c": uniform})
+            return
+        if uniform is None:
+            return
+        own_policy = node.get("policy_index")
+        if full and isinstance(own_policy, int):
+            rules.append({"p": full, "e": 1, "c": own_policy})
+        for child in node.get("children", {}).values():
+            walk(child)
+
+    for child in root.get("children", {}).values():
+        walk(child)
+
+    rules.sort(key=lambda rule: (len(str(rule["p"])), int(rule["e"])), reverse=True)
+    return rules
+
+
+def _script_config_for_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    adr = policy.get("adr") if isinstance(policy.get("adr"), dict) else {}
+    settings = _normalize_script_settings(_default_script_settings_for_policy(policy))
+    return {
+        "presetName": str(policy.get("preset_name") or "Preset"),
+        "presetId": _optional_int(policy.get("preset_id")),
+        "w20": round(float(settings["w20"]), 6),
+        "adrFlat": round(float(adr.get("flat", 0.0) or 0.0), 6),
+        "adrSMulti": round(float(adr.get("s_multi", 0.0) or 0.0), 6),
+        "adrDMulti": round(float(adr.get("d_multi", 0.0) or 0.0), 6),
+        "fuzzFactor": round(float(settings["fuzz_factor"]), 6),
+        "maxInterval": int(settings["max_interval"]),
+        "softCapEnabled": bool(settings["soft_cap_enabled"]),
+        "softCapThreshold": round(float(settings["soft_cap_threshold"]), 3),
+        "softCapPower": round(float(settings["soft_cap_power"]), 6),
+    }
+
+
+def _custom_scheduling_script_js(
+    policies: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+    *,
+    source_label: str,
+) -> str:
+    configs_json = json.dumps(
+        [_script_config_for_policy(policy) for policy in policies],
+        ensure_ascii=False,
+        indent=2,
+    )
+    rules_json = json.dumps(rules, ensure_ascii=False, indent=2)
+    generated_at = _now_iso()
+    header = (
+        "// Linear ADR custom scheduling script\n"
+        f"// Generated: {generated_at}\n"
+        f"// Source: {source_label}\n"
+        "// Paste into Anki Deck Options > Advanced > Custom scheduling.\n"
+        "// Fixed DR and Normal Anki policies are intentionally not included.\n\n"
+        f"const CONFIGS = {configs_json};\n\n"
+        f"const RULES = {rules_json};\n\n"
+    )
+    body = r"""
+function deckName() {
+  if (typeof ctx !== "undefined" && ctx.deckName) return ctx.deckName;
+  if (typeof document !== "undefined") {
+    const deck = document.getElementById("deck");
+    const name = deck?.getAttribute("deck_name");
+    if (name) return name;
+  }
+  return "";
+}
+
+function configForDeck(name) {
+  for (const rule of RULES) {
+    if (rule.e ? name === rule.p : name === rule.p || name.startsWith(rule.p + "::")) {
+      return CONFIGS[rule.c] ?? null;
+    }
+  }
+  return null;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function sigmoid(value) {
+  return 1 / (1 + Math.exp(-clamp(value, -10, 10)));
+}
+
+function safeLog(value) {
+  return Math.log(Math.max(value, 1e-12));
+}
+
+function currentNormalState() {
+  return states.current?.normal ?? states.current?.filtered?.rescheduling?.originalState ?? null;
+}
+
+function desiredRetention(stability, difficulty, cfg) {
+  return clamp(
+    sigmoid(cfg.adrFlat + cfg.adrSMulti * safeLog(stability) + cfg.adrDMulti * difficulty),
+    0,
+    0.995
+  );
+}
+
+function intervalForRetention(stability, retention, cfg) {
+  if (!Number.isFinite(cfg.w20) || cfg.w20 <= 0) return null;
+  const decay = -cfg.w20;
+  const factor = Math.pow(0.9, 1 / decay) - 1;
+  if (!Number.isFinite(factor) || factor === 0) return null;
+  return Math.max(1, stability / factor * (Math.pow(retention, 1 / decay) - 1));
+}
+
+function softPowerCap(interval, cfg) {
+  if (!Number.isFinite(interval) || !cfg.softCapEnabled) return interval;
+  const threshold = Number(cfg.softCapThreshold);
+  if (!Number.isFinite(threshold) || threshold <= 0 || interval <= threshold) return interval;
+  const power = clamp(Number(cfg.softCapPower), 0.01, 0.99);
+  const excess = interval - threshold;
+  return threshold + excess / Math.pow(1 + excess, 1 - power);
+}
+
+function fuzzDelta(interval, cfg) {
+  const scale = Number.isFinite(cfg.fuzzFactor) ? cfg.fuzzFactor : 1;
+  const ranges = [
+    [2.5, 7, 0.15],
+    [7, 20, 0.1],
+    [20, Infinity, 0.05],
+  ];
+  let delta = 1;
+  for (const [start, end, factor] of ranges) {
+    delta += factor * scale * Math.max(Math.min(interval, end) - start, 0);
+  }
+  return delta;
+}
+
+function fuzzBounds(target, lastInterval, cfg) {
+  const maxInterval = Math.max(1, Math.round(Number(cfg.maxInterval) || 36500));
+  const delta = fuzzDelta(target, cfg);
+  let min = Math.max(2, Math.round(target - delta));
+  let max = Math.min(maxInterval, Math.round(target + delta));
+  if (target > lastInterval) {
+    min = Math.max(min, lastInterval + 1);
+  }
+  return [Math.min(min, max), max];
+}
+
+function fuzzedInterval(interval, lastInterval, cfg) {
+  if (!Number.isFinite(interval)) return null;
+  const maxInterval = Math.max(1, Math.round(Number(cfg.maxInterval) || 36500));
+  const target = clamp(interval, 1, maxInterval);
+  const rounded = clamp(Math.round(target), 1, maxInterval);
+  if (cfg.fuzzFactor < 0 || target < 2.5) {
+    return rounded;
+  }
+  const [min, max] = fuzzBounds(target, lastInterval, cfg);
+  return clamp(min + Math.floor(Math.random() * (max - min + 1)), 1, maxInterval);
+}
+
+function lastIntervalDays(current) {
+  return Math.max(
+    Number.isFinite(current?.review?.scheduledDays) ? Math.round(current.review.scheduledDays) : 0,
+    Number.isFinite(current?.relearning?.review?.scheduledDays)
+      ? Math.round(current.relearning.review.scheduledDays)
+      : 0,
+    Number.isFinite(states.current?.card?.ivl) ? Math.round(states.current.card.ivl) : 0,
+    Number.isFinite(states.current?.card?.interval) ? Math.round(states.current.card.interval) : 0,
+    0
+  );
+}
+
+function addTargets(normal, targets) {
+  if (!normal) return;
+  if (normal.review) targets.push(normal.review);
+  if (normal.relearning?.review) targets.push(normal.relearning.review);
+  if (Number.isFinite(normal.learning?.scheduledDays)) targets.push(normal.learning);
+  if (Number.isFinite(normal.new?.scheduledDays)) targets.push(normal.new);
+}
+
+function targetsFor(button) {
+  const targets = [];
+  addTargets(states[button]?.normal, targets);
+  addTargets(states[button]?.filtered?.rescheduling?.originalState, targets);
+  return targets;
+}
+
+function adjustTarget(target, lastInterval, cfg) {
+  const stability = Number(target?.memoryState?.stability);
+  const difficulty = Number(target?.memoryState?.difficulty);
+  if (!Number.isFinite(stability) || !Number.isFinite(difficulty)) return;
+  const retention = desiredRetention(stability, difficulty, cfg);
+  const raw = intervalForRetention(stability, retention, cfg);
+  const capped = softPowerCap(raw, cfg);
+  const scheduledDays = fuzzedInterval(capped, lastInterval, cfg);
+  if (!Number.isFinite(scheduledDays) || scheduledDays <= 0) return;
+  target.scheduledDays = scheduledDays;
+}
+
+const cfg = configForDeck(deckName());
+if (!cfg) return;
+
+const current = currentNormalState();
+if (!current) return;
+
+const lastInterval = lastIntervalDays(current);
+for (const button of ["again", "hard", "good", "easy"]) {
+  for (const target of targetsFor(button)) {
+    adjustTarget(target, lastInterval, cfg);
+  }
+}
+"""
+    return header + body.strip() + "\n"
+
+
+def _write_custom_scheduling_script(
+    policies: list[dict[str, Any]],
+    *,
+    source_label: str,
+) -> CustomSchedulingScriptResult:
+    eligible = [policy for policy in policies if _policy_is_script_eligible(policy)]
+    skipped = len(policies) - len(eligible)
+    if not eligible:
+        raise ValueError("No ADR policies were selected for the custom scheduling script.")
+    rules = _build_custom_script_rules(eligible)
+    if not rules:
+        raise ValueError("No current normal decks match the selected ADR policies.")
+    script = _custom_scheduling_script_js(eligible, rules, source_label=source_label)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    output_path = OUTPUTS_DIR / f"adr-custom-scheduling-script-{stamp}.txt"
+    output_path.write_text(script, encoding="utf-8")
+    return CustomSchedulingScriptResult(
+        output_path=output_path,
+        included_policy_count=len(eligible),
+        skipped_policy_count=skipped,
+        rule_count=len(rules),
+    )
 
 
 def _readonly_item_flags(item: QTableWidgetItem) -> Any:
@@ -3520,9 +4398,23 @@ def _review_batch_optimizer_result(
     except Exception as exc:
         showWarning(f"Could not save car:\n{exc}", title=ADDON_TITLE)
         return False
-    _show_info(
-        f"Saved car {_short_car_id(car)} with {len(review.policies)} preset policy snapshots."
-    )
+    if review.generate_script:
+        try:
+            script_result = _write_custom_scheduling_script(
+                car.get("policies", []),
+                source_label=f"optimizer car {_short_car_id(car)}",
+            )
+        except Exception as exc:
+            showWarning(
+                f"Saved car {_short_car_id(car)}, but could not generate the custom scheduling script:\n{exc}",
+                title=ADDON_TITLE,
+            )
+            return True
+        _show_custom_scheduling_script_result(script_result)
+    else:
+        _show_info(
+            f"Saved car {_short_car_id(car)} with {len(review.policies)} preset policy snapshots."
+        )
     return True
 
 
@@ -3558,6 +4450,16 @@ def _manage_cars() -> None:
     _archive_obsolete_cars_for_all_decks()
     dialog = ManageCarsDialog()
     _exec_dialog(dialog)
+
+
+def _generate_custom_scheduling_script() -> None:
+    if not _active_cars():
+        showWarning("No active cars found. Optimize ADR parameters first.", title=ADDON_TITLE)
+        return
+    dialog = CustomSchedulingScriptDialog()
+    if _exec_dialog(dialog) != 1 or dialog.result is None:
+        return
+    _show_custom_scheduling_script_result(dialog.result)
 
 
 def _generate_combined_filtered_deck() -> None:
@@ -3903,6 +4805,44 @@ def _open_output_folder() -> None:
     opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(OUTPUTS_DIR)))
     if not opened:
         showWarning(f"Could not open output folder:\n{OUTPUTS_DIR}", title=ADDON_TITLE)
+
+
+def _show_custom_scheduling_script_result(result: CustomSchedulingScriptResult) -> None:
+    dialog = QDialog(mw)
+    dialog.setWindowTitle(ADDON_TITLE)
+    dialog.resize(680, 360)
+
+    lines = [
+        "Custom scheduling script generated.",
+        "",
+        f"Included ADR presets: {result.included_policy_count}",
+        f"Deck-name rules: {result.rule_count}",
+        f"Not included: {result.skipped_policy_count}",
+        "",
+        "Anki's existing custom scheduling script was not changed.",
+        "Paste this file into Deck Options > Advanced > Custom scheduling when ready.",
+        "",
+        f"Script file:\n{result.output_path}",
+        "",
+        f"Output folder:\n{OUTPUTS_DIR}",
+    ]
+
+    layout = QVBoxLayout(dialog)
+    label = QLabel("\n".join(lines), dialog)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    open_folder = QPushButton("Open folder", dialog)
+    ok = QPushButton("OK", dialog)
+    buttons.addWidget(open_folder)
+    buttons.addWidget(ok)
+    layout.addLayout(buttons)
+
+    qconnect(open_folder.clicked, _open_output_folder)
+    qconnect(ok.clicked, dialog.accept)
+    _exec_dialog(dialog)
 
 
 def _build_scheduling_preview(deck_id: int | None) -> dict[str, Any]:
@@ -4703,17 +5643,20 @@ def _install_menu() -> None:
 
     write_action = QAction("Write button usage file", mw)
     optimize_action = QAction("Optimize ADR Parameters", mw)
+    custom_script_action = QAction("Generate custom scheduling script", mw)
     manage_cars_action = QAction("Manage cars 🚙", mw)
     combined_filtered_action = QAction("Generate combined filtered deck", mw)
     simulate_action = QAction("Draw pareto plot for one preset", mw)
     qconnect(write_action.triggered, prompt_and_export)
     qconnect(optimize_action.triggered, _optimize_adr_parameters)
+    qconnect(custom_script_action.triggered, _generate_custom_scheduling_script)
     qconnect(manage_cars_action.triggered, _manage_cars)
     qconnect(combined_filtered_action.triggered, _generate_combined_filtered_deck)
     qconnect(simulate_action.triggered, _simulate_with_export)
     adr_menu.addAction(write_action)
     adr_menu.addSeparator()
     adr_menu.addAction(optimize_action)
+    adr_menu.addAction(custom_script_action)
     adr_menu.addAction(manage_cars_action)
     adr_menu.addAction(combined_filtered_action)
     adr_menu.addSeparator()
