@@ -10,7 +10,7 @@
   "soft_interval_cap_power": 0.5,
   "filtered_deck_reschedule": true,
   "filtered_deck_order": "Due",
-  "workload_visualizer_subdivisions": 20,
+  "workload_visualizer_subdivisions": 5,
   "load_balancer_review_count_power": 2.15,
   "load_balancer_interval_power": 3.0
 }

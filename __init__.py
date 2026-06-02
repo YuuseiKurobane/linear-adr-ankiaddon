@@ -94,6 +94,7 @@ POLICY_MODE_FIXED_DR = "fixed_dr"
 POLICY_MODE_NORMAL_ANKI = "normal_anki"
 CARD_CUSTOM_DATA_RESCHEDULE_KEY = "v"
 CARD_CUSTOM_DATA_RESCHEDULE_VALUE = "reschedule"
+DEFAULT_TIMELINE_SUBDIVISIONS = 5
 
 POLICY_MODE_LABELS = {
     POLICY_MODE_ADR: "ADR",
@@ -126,7 +127,7 @@ DEFAULT_ADDON_CONFIG: dict[str, Any] = {
     "soft_interval_cap_power": 0.5,
     "filtered_deck_reschedule": True,
     "filtered_deck_order": "Due",
-    "workload_visualizer_subdivisions": 20,
+    "workload_visualizer_subdivisions": DEFAULT_TIMELINE_SUBDIVISIONS,
     "load_balancer_review_count_power": 2.15,
     "load_balancer_interval_power": 3.0,
 }
@@ -2126,6 +2127,7 @@ class SchedulingOperationDialog(QDialog):
         slider_layout = QVBoxLayout(self.slider_panel)
         slider_layout.setContentsMargins(0, 0, 0, 0)
         self.slider = QSlider(_qt_horizontal(), self.slider_panel)
+        _configure_position_slider(self.slider)
         slider_max = _drive_slider_max_value(self.preview)
         self.slider.setRange(0, slider_max)
         self.slider.setValue(slider_max)
@@ -3399,6 +3401,17 @@ def _qt_horizontal() -> Any:
     return getattr(enum, "Horizontal")
 
 
+def _configure_position_slider(slider: QSlider) -> None:
+    slider.setSingleStep(1)
+    slider.setPageStep(1)
+    slider.setTickInterval(1)
+    slider.setTracking(False)
+    try:
+        slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+    except AttributeError:
+        slider.setTickPosition(QSlider.TicksBelow)
+
+
 def _load_export_rows(path: Path) -> list[dict[str, Any]]:
     rows = []
     with path.open("r", encoding="utf-8") as handle:
@@ -3905,9 +3918,12 @@ def _build_scheduling_preview(deck_id: int | None) -> dict[str, Any]:
 def _timeline_subdivision_count(config: dict[str, Any] | None = None) -> int:
     config = config or _addon_config()
     try:
-        count = int(config.get("workload_visualizer_subdivisions", 20) or 20)
+        count = int(
+            config.get("workload_visualizer_subdivisions", DEFAULT_TIMELINE_SUBDIVISIONS)
+            or DEFAULT_TIMELINE_SUBDIVISIONS
+        )
     except (TypeError, ValueError):
-        count = 20
+        count = DEFAULT_TIMELINE_SUBDIVISIONS
     return max(2, min(200, count))
 
 
