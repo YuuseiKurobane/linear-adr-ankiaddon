@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+exports/*
+!exports/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+*.log
+.DS_Store
+Thumbs.db

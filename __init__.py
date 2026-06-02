@@ -80,10 +80,10 @@ ADVANCED_FIELDS = [
     "fixed_dr_start_pct",
     "fixed_dr_end_pct",
     "fixed_dr_label_step_pct",
-    "aggressive_calm_regret_pct",
     "ignore_safety",
     "safety_checks",
     "safety_s_max",
+    "aggressive_calm_regret_pct",
     "seed",
 ]
 
@@ -631,10 +631,11 @@ class SimulationDialog(QDialog):
         self._refreshing_quality = False
 
         self.setWindowTitle(ADDON_TITLE)
-        self.resize(920, 720)
+        self.resize(720, 640)
 
         layout = QVBoxLayout(self)
-        file_label = QLabel(f"Button usage file:\n{export_path}", self)
+        file_label = QLabel(f"Button usage file:\n{_display_path(export_path)}", self)
+        file_label.setToolTip(str(export_path))
         file_label.setWordWrap(True)
         layout.addWidget(file_label)
 
@@ -661,10 +662,19 @@ class SimulationDialog(QDialog):
         layout.addLayout(top_form)
 
         tabs = QTabWidget(self)
-        tabs.addTab(self._make_tab(BASIC_FIELDS), "Settings")
-        tabs.addTab(self._make_tab([(name, name) for name in ADVANCED_FIELDS]), "Advanced")
-        tabs.addTab(self._make_tab([(name, name) for name in CONTROL_FIELDS]), "Control")
-        tabs.addTab(self._make_tab([(name, name) for name in HIDDEN_FIELDS]), "Hidden")
+        tabs.addTab(self._make_settings_tab(BASIC_FIELDS), "Settings")
+        tabs.addTab(
+            self._make_grid_tab([(name, name) for name in ADVANCED_FIELDS], columns=3),
+            "Advanced",
+        )
+        tabs.addTab(
+            self._make_grid_tab([(name, name) for name in CONTROL_FIELDS], columns=3),
+            "Control",
+        )
+        tabs.addTab(
+            self._make_grid_tab([(name, name) for name in HIDDEN_FIELDS], columns=3),
+            "Hidden",
+        )
         layout.addWidget(tabs, 1)
 
         buttons = QHBoxLayout()
@@ -686,15 +696,41 @@ class SimulationDialog(QDialog):
         self._quality_changed()
         self._preset_changed()
 
-    def _make_tab(self, fields: list[tuple[str, str]]) -> QScrollArea:
+    def _make_settings_tab(self, fields: list[tuple[str, str]]) -> QScrollArea:
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         container = QWidget(scroll)
         grid = QGridLayout(container)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setHorizontalSpacing(18)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 0)
+        grid.setColumnStretch(2, 1)
+        grid.setHorizontalSpacing(20)
+        grid.setVerticalSpacing(10)
+
+        for row, (key, label) in enumerate(fields):
+            label_widget = QLabel(label, container)
+            label_widget.setWordWrap(True)
+            label_widget.setMaximumWidth(280)
+            widget = self._make_field(key, settings=True)
+            self.fields[key] = widget
+            grid.addWidget(label_widget, row, 0)
+            grid.addWidget(widget, row, 1)
+
+        grid.setRowStretch(len(fields), 1)
+
+        scroll.setWidget(container)
+        return scroll
+
+    def _make_grid_tab(self, fields: list[tuple[str, str]], *, columns: int) -> QScrollArea:
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        container = QWidget(scroll)
+        grid = QGridLayout(container)
+        for col in range(columns):
+            grid.setColumnStretch(col, 1)
+        grid.setHorizontalSpacing(16)
         grid.setVerticalSpacing(8)
+        rows = max(1, (len(fields) + columns - 1) // columns)
 
         for index, (key, label) in enumerate(fields):
             field_box = QWidget(container)
@@ -710,15 +746,15 @@ class SimulationDialog(QDialog):
             self.fields[key] = widget
             field_layout.addWidget(widget)
 
-            row = index // 2
-            col = index % 2
+            row = index % rows
+            col = index // rows
             grid.addWidget(field_box, row, col)
 
-        grid.setRowStretch((len(fields) + 1) // 2, 1)
+        grid.setRowStretch(rows, 1)
         scroll.setWidget(container)
         return scroll
 
-    def _make_field(self, key: str) -> QWidget:
+    def _make_field(self, key: str, *, settings: bool = False) -> QWidget:
         if key in BOOL_FIELDS:
             widget = QCheckBox(self)
             return widget
@@ -727,18 +763,18 @@ class SimulationDialog(QDialog):
             widget.setRange(0, 2_000_000_000)
             widget.setSingleStep(1)
             widget.setKeyboardTracking(False)
-            widget.setMaximumWidth(170)
+            _set_field_width(widget, 170, fixed=settings)
             return widget
         if key in FLOAT_FIELDS:
-            widget = NoWheelDoubleSpinBox(self)
+            widget = QDoubleSpinBox(self) if key == "target_dr" else NoWheelDoubleSpinBox(self)
             widget.setRange(-1_000_000.0, 1_000_000.0)
             widget.setDecimals(6)
             widget.setSingleStep(0.01)
             widget.setKeyboardTracking(False)
-            widget.setMaximumWidth(170)
+            _set_field_width(widget, 170, fixed=settings)
             return widget
         widget = QLineEdit(self)
-        widget.setMaximumWidth(260)
+        _set_field_width(widget, 260, fixed=settings)
         return widget
 
     def _quality_changed(self, *_args: Any) -> None:
@@ -999,6 +1035,12 @@ def config_for_quality(name: str) -> dict[str, Any]:
     config.update(FULL_HORIZON_VALUES)
     config.update(QUALITY_PRESET_VALUES[name])
     return config
+
+
+def _set_field_width(widget: QWidget, width: int, *, fixed: bool) -> None:
+    if fixed:
+        widget.setMinimumWidth(width)
+    widget.setMaximumWidth(width)
 
 
 def executable_name() -> str:
@@ -1267,6 +1309,19 @@ def _jsonable_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_jsonable_value(part) for part in value]
     return value
+
+
+def _display_path(path: Path, max_chars: int = 92) -> str:
+    text = str(path)
+    if len(text) <= max_chars:
+        return text
+    filename = path.name
+    parent = path.parent.name
+    suffix = f"{parent}\\{filename}" if parent else filename
+    room = max_chars - len(suffix) - 3
+    if room <= 0:
+        return "..." + suffix[-(max_chars - 3):]
+    return text[:room] + "..." + suffix
 
 
 def _row_label(row: dict[str, Any]) -> str:
