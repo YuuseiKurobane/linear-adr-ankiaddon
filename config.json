@@ -2,7 +2,6 @@
   "custom_quality_presets": [],
   "track_adr_optimization_history": true,
   "enable_advanced_safeguards": true,
-  "warn_before_creating_new_car_when_active_exists": true,
   "warn_before_moving_car_forward": true,
   "warn_before_allowing_car_overtaking": true,
   "warn_before_editing_saved_adr_parameters": true,
@@ -11,5 +10,7 @@
   "soft_interval_cap_power": 0.5,
   "filtered_deck_reschedule": true,
   "filtered_deck_order": "Due",
-  "workload_visualizer_subdivisions": 20
+  "workload_visualizer_subdivisions": 20,
+  "load_balancer_review_count_power": 2.15,
+  "load_balancer_interval_power": 3.0
 }

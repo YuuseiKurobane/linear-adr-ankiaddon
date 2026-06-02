@@ -33,12 +33,14 @@ those policies to review cards.
 - Lets saved policies use ADR parameters, a fixed desired-retention target, or
   normal Anki scheduling on a per-preset basis.
 - Manages active cars, including moving a car's position date, driving a car to
-  timeline start, deleting a car, and preserving archived history when enabled.
+  timeline start, restoring archived cars when history is enabled, and deleting
+  a car.
 - Generates filtered decks from active car policies, with configurable deck name,
-  sort order, filtered-deck rescheduling, date-based oldest-car movement, and
+  sort order, filtered-deck rescheduling, date-based newest-car movement, and
   workload previews.
 - Reschedules review cards by computing intervals from card memory state,
-  selected policy, and the optional soft interval cap.
+  selected policy, FSRS-style fuzz/load balancing, and the optional soft
+  interval cap.
 - Provides deck-scoped actions in each deck's gear menu and collection-wide
   actions from the top-level `ADR` menu.
 
@@ -51,30 +53,28 @@ preset policy.
 
 When more than one active car can handle a card, the add-on now chooses the car
 with the closest earlier `position_date`; `created_at` is only a tie-breaker.
-That means cars can overtake each other when their positions are moved. A newly
-created car still behaves as expected when positions are in creation order, but
-manual movement is no longer overridden by creation date.
+Scheduling operations move the latest-position car, so manual movement is not
+overridden by creation date.
 
-Scheduling operations can drive the oldest active car backward with a date-based
-slider. The slider controls the car's position on the review timeline, not an
-exact card count. Moving the car farther back expands the historical range that
-can be handled by that car; the workload preview shows how many reviews are due
-under the selected position.
+Scheduling operations drive the latest-position active car backward with a
+date-based slider. The slider controls the car's position on the review
+timeline, not an exact card count. Moving the car farther back expands the
+historical range that can be handled by that car.
 
-Driving a car to timeline start keeps that car active as the oldest scheduler
-that still affects the collection. There can only be one timeline-start car; if
-a newer live car is driven to timeline start, it replaces the previous
-timeline-start car in active scheduling. Anki's normal undo can undo card
+When the moving latest-position car crosses older cars, those older cars are
+removed from active scheduling. If history tracking is enabled, swept cars are
+archived and can be restored from `ADR Helper -> Manage cars -> Manually manage
+cars`; otherwise they are discarded. Anki's normal undo can undo card
 rescheduling, but car timeline changes are restored from `ADR Helper -> Manage
 cars -> Manually manage cars -> Undo last car change`.
 
 The single-preset Pareto report offers `Create car` and `Append policy to latest
 car`. "Latest" means the active car with the newest position date, not the newest
-creation timestamp. This is intentional so users who manually allow cars to
-overtake each other can append missing preset policies to the car that is
-currently furthest along the timeline. Appending a policy replaces the existing
-policy for that preset in the latest-position car after a warning; use
-`Create car` when the goal is to start a new scheduling era.
+creation timestamp. This is intentional so users who manually reorder cars can
+append missing preset policies to the car that is currently furthest along the
+timeline. Appending a policy replaces the existing policy for that preset in the
+latest-position car after a warning; use `Create car` when the goal is to start
+a new scheduling era.
 
 ## Local Files
 
@@ -83,7 +83,8 @@ policy for that preset in the latest-position car after a warning; use
   summaries.
 - `cars.json`: active cars, archived car history, and filtered-deck transactions.
 - `config.json`: add-on defaults for warnings, history tracking, soft interval
-  cap behavior, custom quality presets, and filtered-deck options.
+  cap behavior, custom quality presets, filtered-deck options, timeline
+  subdivisions, and load-balance powers.
 - `helper/`: bundled optimizer binaries for supported desktop platforms.
 
 ## Notes
