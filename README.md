@@ -1,6 +1,6 @@
 Original concept by 1DWalker: [srs-simulator on the `fsrs-sa` branch](https://github.com/1DWalker/srs-simulator/tree/fsrs-sa).
 
-Rust helper files source: [YuuseiKurobane/linear-adr-ankiaddon](https://github.com/YuuseiKurobane/linear-adr).
+Rust helper files source: [YuuseiKurobane/linear-adr-optimizer](https://github.com/YuuseiKurobane/linear-adr-optimizer).
 
 Legacy Python version: [YuuseiKurobane/linear-adr-optimizer-python](https://github.com/YuuseiKurobane/linear-adr-optimizer-python).
 
